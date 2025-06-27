@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "janus"
+version = "0.1.0"
+description = "Symbolic knowledge discovery with multi-agent RL."
+authors = [
+    {name = "JanusAI Team"}
+]
+dependencies = [
+    "torch",
+    "gymnasium",
+    "sympy",
+    "pyyaml",
+    "wandb",
+    "typer",
+]
