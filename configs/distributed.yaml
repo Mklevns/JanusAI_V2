@@ -1,0 +1,53 @@
+# ----------------------------------------
+# configs/distributed.yaml - Multi-GPU
+# ----------------------------------------
+# For distributed training across multiple GPUs
+learning_rate: 0.0001  # Lower LR for larger effective batch
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+n_epochs: 10
+batch_size: 512  # Per GPU
+action_space_type: "continuous"
+
+# Distributed optimization
+max_grad_norm: 0.5
+use_mixed_precision: true
+gradient_accumulation_steps: 4  # Effective batch = 512 * 4 * num_gpus
+clip_vloss: true
+normalize_advantages: true
+normalize_rewards: true
+
+# Adaptive scheduling
+lr_schedule: "cosine"
+lr_end: 0.000001
+clip_schedule: "linear"
+clip_end: 0.05
+entropy_schedule: "cosine"
+entropy_end: 0.0001
+target_kl: 0.02
+
+# Hardware
+device: "cuda"
+num_workers: 16
+use_subprocess_envs: true
+
+# Distributed settings
+distributed_backend: "nccl"
+find_unused_parameters: false
+gradient_as_bucket_view: true
+
+# Error handling
+fail_on_env_error: false
+max_env_retries: 10
+
+# Logging
+log_interval: 5
+save_interval: 25
+eval_interval: 100
+experiment_name: "ppo_distributed_${RANK}"
+experiment_tags:
+  world_size: "${WORLD_SIZE}"
+  node_rank: "${NODE_RANK}"

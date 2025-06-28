@@ -1,17 +1,20 @@
+# ----------------------------------------
 # critic_network_config.yaml
-# Critic network configuration
-
-layer_sizes: [256, 256]
-activation: relu
+# ----------------------------------------
+# Critic network architecture configuration
+network_type: "mlp"
+hidden_sizes: [256, 256]
+activation: "tanh"
 use_layer_norm: false
-use_batch_norm: false
-use_spectral_norm: false
 dropout_rate: 0.0
-initialization: orthogonal
-gain: 1.0
 
-# Recurrent options (optional)
-use_recurrent: false
-recurrent_type: lstm
-recurrent_hidden_size: 128
-recurrent_layers: 1
+# Initialization
+init_method: "orthogonal"
+init_gain: 1.0  # Standard for value function
+
+# Architecture variants
+use_lstm: false
+lstm_hidden_size: 128
+use_attention: false
+attention_heads: 4
+separate_networks: true  # Separate actor-critic networks

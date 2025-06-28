@@ -1,0 +1,53 @@
+# ----------------------------------------
+# configs/gpu_optimized.yaml - Single GPU
+# ----------------------------------------
+# Optimized for single GPU training
+learning_rate: 0.0003
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+n_epochs: 10
+batch_size: 256  # Larger for GPU efficiency
+action_space_type: "continuous"
+
+# GPU optimization
+max_grad_norm: 0.5
+use_mixed_precision: true  # Enable AMP
+gradient_accumulation_steps: 2
+clip_vloss: true
+normalize_advantages: true
+normalize_rewards: true
+
+# Scheduling
+lr_schedule: "cosine"
+lr_end: 0.00001
+clip_schedule: "linear"
+clip_end: 0.1
+entropy_schedule: "linear"
+entropy_end: 0.001
+target_kl: 0.015
+
+# Hardware
+device: "cuda"
+num_workers: 8
+use_subprocess_envs: true
+
+# Error handling
+fail_on_env_error: false
+max_env_retries: 5
+
+# Logging
+log_interval: 10
+save_interval: 50
+eval_interval: 200
+experiment_name: "ppo_gpu_${HOSTNAME}"
+experiment_tags:
+  gpu_model: "${GPU_MODEL}"
+  cuda_version: "${CUDA_VERSION}"
+
+# Performance
+enable_profiling: true
+profiler_trace_path: "traces/gpu/"
+enable_anomaly_detection: false
