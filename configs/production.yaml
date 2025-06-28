@@ -1,0 +1,50 @@
+# PPO Hyperparameters
+learning_rate: 0.0003
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+n_epochs: 10
+batch_size: 256  # Larger for production
+
+# Stability
+max_grad_norm: 0.5
+use_mixed_precision: true
+gradient_accumulation_steps: 4
+clip_vloss: true
+normalize_advantages: true
+normalize_rewards: true
+
+# Scheduling
+lr_schedule: "cosine"
+lr_end: 0.00001
+clip_schedule: "linear"
+clip_end: 0.1
+entropy_schedule: "linear"
+entropy_end: 0.001
+target_kl: 0.015
+
+# Hardware
+device: "cuda"
+num_workers: 16
+use_subprocess_envs: true
+
+# Error handling
+fail_on_env_error: false
+max_env_retries: 5
+
+# Logging
+log_interval: 10
+save_interval: 100
+eval_interval: 500
+experiment_name: "ppo_production_${HOSTNAME}_${TIMESTAMP}"
+experiment_tags:
+  version: "1.0.0"
+  environment: "production"
+  cluster: "${CLUSTER_NAME}"
+
+# Monitoring
+enable_profiling: false
+enable_anomaly_detection: false
+checkpoint_metric: "eval_reward"

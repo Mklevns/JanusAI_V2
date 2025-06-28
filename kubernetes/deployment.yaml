@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ppo-trainer
+  labels:
+    app: ppo-trainer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ppo-trainer
+  template:
+    metadata:
+      labels:
+        app: ppo-trainer
+    spec:
+      containers:
+      - name: trainer
+        image: janus-ppo:latest
+        resources:
+          limits:
+            nvidia.com/gpu: 2
+            memory: "32Gi"
+            cpu: "16"
+          requests:
+            nvidia.com/gpu: 2
+            memory: "16Gi"
+            cpu: "8"
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret
+              key: api-key
+        volumeMounts:
+        - name: checkpoints
+          mountPath: /app/checkpoints
+        - name: logs
+          mountPath: /app/logs
+        - name: config
+          mountPath: /app/configs
+      volumes:
+      - name: checkpoints
+        persistentVolumeClaim:
+          claimName: checkpoints-pvc
+      - name: logs
+        persistentVolumeClaim:
+          claimName: logs-pvc
+      - name: config
+        configMap:
+          name: ppo-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tensorboard
+spec:
+  selector:
+    app: ppo-trainer
+  ports:
+  - port: 6006
+    targetPort: 6006
+  type: LoadBalancer
