@@ -1,0 +1,64 @@
+name: PPO Training CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |
+        pip install flake8 black isort mypy
+    - name: Run linting
+      run: |
+        flake8 janus/training/ppo --max-line-length=88
+        black --check janus/training/ppo
+        isort --check-only janus/training/ppo
+        mypy janus/training/ppo --ignore-missing-imports
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10']
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=janus.training.ppo --cov-report=xml
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build Docker image
+      run: |
+        docker build -t ppo-training:latest .
+    - name: Run integration test
+      run: |
+        docker run --rm ppo-training:latest python -m janus.training.ppo.main \
+          --total-timesteps 1000 \
+          --rollout-length 128 \
+          --num-envs 2
