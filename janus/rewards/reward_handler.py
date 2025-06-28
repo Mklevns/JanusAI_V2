@@ -6,6 +6,7 @@ for flexible reward structures in reinforcement learning environments.
 """
 
 from typing import Any, Dict, List, Optional, Type
+import numpy as np
 from .base import BaseRewardComponent
 from .components import (
     TaskSuccessReward,
@@ -18,6 +19,8 @@ from .custom_components import (
     CommunicationEfficiencyReward,
     AdaptiveDifficultyReward,
 )
+
+
 
 
 class RewardHandler:

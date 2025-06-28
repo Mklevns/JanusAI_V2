@@ -1,0 +1,28 @@
+# config.yaml - Custom reward components
+
+rewards:
+  components:
+    # For symbolic regression tasks
+    - type: symbolic_regression
+      enabled: true
+      weight: 1.0
+      accuracy_weight: 10.0
+      parsimony_weight: 2.0
+      target_mse: 0.01
+      
+    # For multi-agent cooperation
+    - type: communication_efficiency
+      enabled: true
+      weight: 0.5
+      message_penalty: 0.1
+      success_bonus: 50.0
+      bandwidth_limit: 10
+      
+    # Dynamic difficulty adjustment
+    - type: adaptive_difficulty
+      enabled: true
+      weight: 1.0
+      base_reward: 10.0
+      difficulty_scale: 2.0
+      success_threshold: 0.8
+      window_size: 100
