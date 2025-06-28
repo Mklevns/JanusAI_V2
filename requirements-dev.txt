@@ -1,0 +1,19 @@
+# Core Dependencies
+torch
+gymnasium
+sympy
+pyyaml
+wandb
+typer
+
+# Discovered Dependencies
+pydantic
+matplotlib
+pandas
+ray[tune]
+stable-baselines3
+
+# Development & Testing Tools
+pytest
+pytest-cov
+streamlit

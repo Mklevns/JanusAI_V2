@@ -56,7 +56,6 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = False
 
 
-
 class PPOTrainer:
     """
     Production-ready PPO trainer with advanced features.
@@ -235,53 +234,134 @@ class PPOTrainer:
 
     def collect_rollouts(self, num_steps: int) -> Dict[str, float]:
         """
-        Collect rollouts from environments for PPO.
-
-        Args:
-            num_steps: Number of steps to collect per environment
-
-        Returns:
-            Dictionary of collection statistics
+        Collect rollouts from environments with modular reward computation.
+        This version properly integrates with AsyncRolloutCollector.collect()
+        and supports the RewardHandler for modular rewards.
         """
         self.buffer.clear()
-        start_time = time.time()
+        collection_start = time.time()
 
-        self._current_values = None
-        cached_actions = {}
+        # Initialize reward tracking for this rollout
+        component_rewards_sum = {}
+        component_rewards_count = 0
 
         for step in range(num_steps):
-
+            # Create action getter function that collector will call
             def get_actions_fn(obs_tensor):
+                """Get actions and log_probs for given observations."""
                 with torch.no_grad():
                     if self.scaler:
-                        with torch.cuda.amp.autocast():
+                        with autocast():
                             actions, log_probs = self.agent.act(obs_tensor)
-                            values = self.agent.critic(obs_tensor).squeeze(-1)
                     else:
                         actions, log_probs = self.agent.act(obs_tensor)
-                        values = self.agent.critic(obs_tensor).squeeze(-1)
-                self._current_values = values.cpu().numpy()
-                cached_actions["actions"] = actions.cpu().numpy()
-                cached_actions["log_probs"] = log_probs.cpu().numpy()
-                return cached_actions["actions"], cached_actions["log_probs"]
 
-            obs, next_obs, rewards, dones, truncateds, log_probs, infos = (
-                self.collector.collect(get_actions_fn, self.executor)
+                return actions.cpu().numpy(), log_probs.cpu().numpy()
+
+            # Collect step - now returns 7 values including infos
+            (
+                original_obs,
+                next_obs,
+                env_rewards,
+                dones,
+                truncateds,
+                log_probs_np,
+                infos,
+            ) = self.collector.collect(get_actions_fn, self.executor)
+
+            # Get values for the original observations
+            obs_tensor = torch.FloatTensor(original_obs).to(self.device)
+            with torch.no_grad():
+                if self.scaler:
+                    with autocast():
+                        # Re-compute actions to ensure consistency
+                        actions, _ = self.agent.act(obs_tensor)
+                        values = self.agent.critic(obs_tensor).squeeze(-1)
+                else:
+                    actions, _ = self.agent.act(obs_tensor)
+                    values = self.agent.critic(obs_tensor).squeeze(-1)
+
+            actions_np = actions.cpu().numpy()
+            values_np = values.cpu().numpy()
+
+            # Compute rewards using RewardHandler if available
+            if self.reward_handler is not None:
+                modular_rewards = np.zeros(self.n_envs, dtype=np.float32)
+
+                for env_idx in range(self.n_envs):
+                    # Compute modular reward for each environment
+                    reward = self.reward_handler.compute_reward(
+                        observation=original_obs[env_idx],
+                        action=actions_np[env_idx],
+                        next_observation=next_obs[env_idx],
+                        info=infos[env_idx],
+                    )
+                    modular_rewards[env_idx] = reward
+
+                    # Track component breakdown if debugging
+                    if self.debug_rewards and step % 100 == 0:  # Log every 100 steps
+                        breakdown = self.reward_handler.get_component_breakdown(
+                            original_obs[env_idx],
+                            actions_np[env_idx],
+                            next_obs[env_idx],
+                            infos[env_idx],
+                        )
+                        for comp_name, comp_reward in breakdown.items():
+                            if comp_name not in component_rewards_sum:
+                                component_rewards_sum[comp_name] = 0.0
+                            component_rewards_sum[comp_name] += comp_reward
+                        component_rewards_count += 1
+
+                # Use modular rewards instead of environment rewards
+                rewards = modular_rewards
+            else:
+                # Use raw environment rewards
+                rewards = env_rewards
+
+            # Apply reward normalization if configured
+            if self.reward_normalizer is not None:
+                self.reward_normalizer.update(rewards.reshape(-1, 1))
+                normalized_rewards = rewards / np.sqrt(
+                    self.reward_normalizer.var + 1e-8
+                )
+            else:
+                normalized_rewards = rewards
+
+            # Store in buffer
+            self.buffer.add(
+                obs=original_obs,
+                action=actions_np,
+                reward=normalized_rewards,
+                done=dones,
+                value=values_np,
+                log_prob=log_probs_np,
             )
 
-            values_np = self._current_values
-            actions_np = cached_actions["actions"]
+            # Handle episode resets for reward handler
+            if self.reward_handler is not None:
+                for env_idx in range(self.n_envs):
+                    if dones[env_idx] or truncateds[env_idx]:
+                        # Reset reward components for completed episodes
+                        # Note: This resets all components - you might want per-env handlers
+                        self.reward_handler.reset()
+                        break  # Only reset once per step
 
-            if self.reward_normalizer:
-                self.reward_normalizer.update(rewards.reshape(-1, 1))
-                rewards = rewards / np.sqrt(self.reward_normalizer.var + 1e-8)
-
-            self.buffer.add(obs, actions_np, rewards, dones, values_np, log_probs)
             self.global_step += self.n_envs
 
+        collection_time = time.time() - collection_start
+
+        # Get statistics
         stats = self.collector.get_statistics()
-        stats["collection_time"] = time.time() - start_time
-        stats["steps_per_second"] = (num_steps * self.n_envs) / stats["collection_time"]
+        stats["collection_time"] = collection_time
+        stats["steps_per_second"] = (num_steps * self.n_envs) / collection_time
+
+        # Add reward component statistics if available
+        if self.debug_rewards and component_rewards_count > 0:
+            for comp_name, total in component_rewards_sum.items():
+                avg_reward = total / component_rewards_count
+                stats[f"reward_component/{comp_name}"] = avg_reward
+
+        return stats
 
     def compute_gae(
         self,
@@ -330,7 +410,9 @@ class PPOTrainer:
         returns = advantages + values
         return advantages, returns
 
-    def learn(self, current_clip_epsilon: float, current_entropy_coef: float) -> Dict[str, float]:
+    def learn(
+        self, current_clip_epsilon: float, current_entropy_coef: float
+    ) -> Dict[str, float]:
         """
         Perform PPO update from collected rollouts.
 
@@ -345,7 +427,9 @@ class PPOTrainer:
         data = self.buffer.get()
 
         with torch.no_grad():
-            obs_tensor = torch.tensor(self.collector.current_obs, dtype=torch.float32, device=self.device)
+            obs_tensor = torch.tensor(
+                self.collector.current_obs, dtype=torch.float32, device=self.device
+            )
             last_values = self.agent.critic(obs_tensor).squeeze(-1)
 
             advantages, returns = self.compute_gae(
@@ -362,17 +446,27 @@ class PPOTrainer:
         b_returns = flatten(returns).squeeze()
 
         if self.config.normalize_advantages:
-            b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+            b_advantages = (b_advantages - b_advantages.mean()) / (
+                b_advantages.std() + 1e-8
+            )
 
-        pg_losses, value_losses, entropy_losses, kl_divs, clip_fractions = [], [], [], [], []
-        total_batch_size = self.config.batch_size * self.config.gradient_accumulation_steps
+        pg_losses, value_losses, entropy_losses, kl_divs, clip_fractions = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        total_batch_size = (
+            self.config.batch_size * self.config.gradient_accumulation_steps
+        )
 
         for epoch in range(self.config.n_epochs):
             indices = np.random.permutation(b_obs.shape[0])
             accumulation_counter = 0
 
             for start_idx in range(0, b_obs.shape[0], self.config.batch_size):
-                batch_indices = indices[start_idx:start_idx + self.config.batch_size]
+                batch_indices = indices[start_idx : start_idx + self.config.batch_size]
                 if len(batch_indices) < self.config.batch_size // 2:
                     continue
 
@@ -390,20 +484,34 @@ class PPOTrainer:
                     values = values.squeeze()
                     ratio = torch.exp(log_probs - b_log_probs[batch_indices])
                     surr1 = ratio * b_advantages[batch_indices]
-                    surr2 = torch.clamp(ratio, 1 - current_clip_epsilon, 1 + current_clip_epsilon) * b_advantages[batch_indices]
+                    surr2 = (
+                        torch.clamp(
+                            ratio, 1 - current_clip_epsilon, 1 + current_clip_epsilon
+                        )
+                        * b_advantages[batch_indices]
+                    )
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                    value_pred_clipped = data["values"].flatten()[batch_indices] + torch.clamp(
+                    value_pred_clipped = data["values"].flatten()[
+                        batch_indices
+                    ] + torch.clamp(
                         values - data["values"].flatten()[batch_indices],
                         -current_clip_epsilon,
                         current_clip_epsilon,
                     )
-                    value_loss = 0.5 * torch.max(
-                        (value_pred_clipped - b_returns[batch_indices]) ** 2,
-                        (values - b_returns[batch_indices]) ** 2
-                    ).mean()
+                    value_loss = (
+                        0.5
+                        * torch.max(
+                            (value_pred_clipped - b_returns[batch_indices]) ** 2,
+                            (values - b_returns[batch_indices]) ** 2,
+                        ).mean()
+                    )
 
-                    loss = policy_loss + self.config.value_coef * value_loss - current_entropy_coef * entropy.mean()
+                    loss = (
+                        policy_loss
+                        + self.config.value_coef * value_loss
+                        - current_entropy_coef * entropy.mean()
+                    )
                     loss /= self.config.gradient_accumulation_steps
 
                     if self.scaler:
@@ -413,24 +521,40 @@ class PPOTrainer:
 
                     accumulation_counter += 1
 
-                    if accumulation_counter % self.config.gradient_accumulation_steps == 0:
+                    if (
+                        accumulation_counter % self.config.gradient_accumulation_steps
+                        == 0
+                    ):
                         if self.scaler:
                             self.scaler.unscale_(self.optimizer)
-                            nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
+                            nn.utils.clip_grad_norm_(
+                                self.agent.parameters(), self.config.max_grad_norm
+                            )
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
-                            nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
+                            nn.utils.clip_grad_norm_(
+                                self.agent.parameters(), self.config.max_grad_norm
+                            )
                             self.optimizer.step()
 
                         self.optimizer.zero_grad()
 
                     with torch.no_grad():
-                        pg_losses.append(policy_loss.item() * self.config.gradient_accumulation_steps)
+                        pg_losses.append(
+                            policy_loss.item() * self.config.gradient_accumulation_steps
+                        )
                         value_losses.append(value_loss.item())
                         entropy_losses.append(entropy.mean().item())
-                        kl_divs.append((b_log_probs[batch_indices] - log_probs).mean().item())
-                        clip_fractions.append((torch.abs(ratio - 1) > current_clip_epsilon).float().mean().item())
+                        kl_divs.append(
+                            (b_log_probs[batch_indices] - log_probs).mean().item()
+                        )
+                        clip_fractions.append(
+                            (torch.abs(ratio - 1) > current_clip_epsilon)
+                            .float()
+                            .mean()
+                            .item()
+                        )
 
                 except Exception as e:
                     logger.error(f"Training error at epoch {epoch}: {e}", exc_info=True)
@@ -455,11 +579,11 @@ class PPOTrainer:
                 "explained_variance": explained_var.item(),
                 "learn_time": time.time() - learn_start,
             }
-    
+
         def train(self, total_timesteps: int, rollout_length: int = 2048):
             """
             Main PPO training loop.
-    
+
             Args:
                 total_timesteps: Total steps to train on
                 rollout_length: Number of env steps per rollout
@@ -471,25 +595,42 @@ class PPOTrainer:
                 device=self.device,
                 n_envs=self.n_envs,
             )
-    
+
             num_updates = total_timesteps // (rollout_length * self.n_envs)
-            logger.info(f"Starting PPO training: {num_updates} updates, {total_timesteps} steps")
+            logger.info(
+                f"Starting PPO training: {num_updates} updates, {total_timesteps} steps"
+            )
             start_time = time.time()
-    
+
             for update in range(1, num_updates + 1):
                 self.num_updates = update
                 progress = update / num_updates
-    
-                lr = self._schedule_hyperparam(self.config.learning_rate, self.config.lr_end, self.config.lr_schedule, progress)
-                clip_eps = self._schedule_hyperparam(self.config.clip_epsilon, self.config.clip_end, self.config.clip_schedule, progress)
-                entropy_coef = self._schedule_hyperparam(self.config.entropy_coef, self.config.entropy_end, self.config.entropy_schedule, progress)
-    
+
+                lr = self._schedule_hyperparam(
+                    self.config.learning_rate,
+                    self.config.lr_end,
+                    self.config.lr_schedule,
+                    progress,
+                )
+                clip_eps = self._schedule_hyperparam(
+                    self.config.clip_epsilon,
+                    self.config.clip_end,
+                    self.config.clip_schedule,
+                    progress,
+                )
+                entropy_coef = self._schedule_hyperparam(
+                    self.config.entropy_coef,
+                    self.config.entropy_end,
+                    self.config.entropy_schedule,
+                    progress,
+                )
+
                 for group in self.optimizer.param_groups:
                     group["lr"] = lr
-    
+
                 rollout_metrics = self.collect_rollouts(rollout_length)
                 learn_metrics = self.learn(clip_eps, entropy_coef)
-    
+
                 all_metrics = {
                     **rollout_metrics,
                     **learn_metrics,
@@ -498,28 +639,35 @@ class PPOTrainer:
                     "entropy_coef": entropy_coef,
                     "update_time": time.time() - start_time,
                 }
-    
+
                 if update % self.config.log_interval == 0:
-                    logger.info(f"Update {update}: Reward {all_metrics.get('mean_episode_reward', 0):.2f} | KL {all_metrics['kl_divergence']:.4f}")
+                    logger.info(
+                        f"Update {update}: Reward {all_metrics.get('mean_episode_reward', 0):.2f} | KL {all_metrics['kl_divergence']:.4f}"
+                    )
                     self._log_metrics(all_metrics)
-    
+
                 if update % self.config.save_interval == 0:
                     self.save_checkpoint()
-    
+
                 if self.eval_env and update % self.config.eval_interval == 0:
                     eval_metrics = self.evaluate(num_episodes=10)
-                    logger.info(f"Eval @ Update {update}: Reward {eval_metrics['eval_reward']:.2f} ± {eval_metrics['eval_reward_std']:.2f}")
+                    logger.info(
+                        f"Eval @ Update {update}: Reward {eval_metrics['eval_reward']:.2f} ± {eval_metrics['eval_reward_std']:.2f}"
+                    )
                     self._log_metrics(eval_metrics, prefix="eval")
-    
+
                     if eval_metrics["eval_reward"] > self.best_eval_reward:
                         self.best_eval_reward = eval_metrics["eval_reward"]
                         self.save_checkpoint(is_best=True)
-    
-                if all_metrics.get("mean_episode_reward", -np.inf) > self.best_mean_reward:
+
+                if (
+                    all_metrics.get("mean_episode_reward", -np.inf)
+                    > self.best_mean_reward
+                ):
                     self.best_mean_reward = all_metrics["mean_episode_reward"]
                     if not self.eval_env:
                         self.save_checkpoint(is_best=True)
-    
+
             logger.info("Training complete")
             self.save_checkpoint(self.checkpoint_dir / "final_model.pt")
             if self.writer:
@@ -527,7 +675,9 @@ class PPOTrainer:
             if self.executor:
                 self.executor.shutdown(wait=True)
 
-    def _schedule_hyperparam(self, initial: float, final: float, mode: str, progress: float) -> float:
+    def _schedule_hyperparam(
+        self, initial: float, final: float, mode: str, progress: float
+    ) -> float:
         if mode == "constant":
             return initial
         elif mode == "linear":
@@ -542,9 +692,13 @@ class PPOTrainer:
             for k, v in metrics.items():
                 self.writer.add_scalar(f"{prefix}/{k}", v, self.global_step)
         if WANDB_AVAILABLE and wandb.run is not None:
-            wandb.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=self.global_step)
+            wandb.log(
+                {f"{prefix}/{k}": v for k, v in metrics.items()}, step=self.global_step
+            )
 
-    def save_checkpoint(self, path: Optional[Path] = None, is_best: bool = False) -> Path:
+    def save_checkpoint(
+        self, path: Optional[Path] = None, is_best: bool = False
+    ) -> Path:
         if path is None:
             name = "best_model.pt" if is_best else f"checkpoint_{self.global_step}.pt"
             path = self.checkpoint_dir / name
