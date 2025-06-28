@@ -26,6 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict
 
 import numpy as np
 import torch

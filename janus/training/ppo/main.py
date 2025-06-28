@@ -193,7 +193,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-name", type=str, default="ppo_experiment", help="Name for this experiment")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory for saving checkpoints")
-    parser.add_unpacked_vars
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--tensorboard", action="store_true", help="Enable TensorBoard logging")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
