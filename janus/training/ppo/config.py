@@ -6,6 +6,7 @@ Configuration module for the PPO Trainer using Pydantic for robust validation.
 import yaml
 import logging
 import os
+import math # Added import
 import re
 import sys
 import datetime
@@ -49,7 +50,7 @@ class PPOConfig(BaseModel):
     gae_lambda: float = Field(
         0.95, gt=0, le=1, description="Lambda for Generalized Advantage Estimation."
     )
-    clip_epsilon: float = Field(0.2, gt=0, lt=1, description="PPO clipping parameter.")
+    clip_epsilon: float = Field(0.2, gt=0, le=1, description="PPO clipping parameter.") # Changed lt=1 to le=1
     value_coef: float = Field(
         0.5, ge=0, description="Coefficient for the value function loss."
     )
@@ -150,10 +151,52 @@ class PPOConfig(BaseModel):
     )
     experiment_name: str = "ppo_experiment"
 
+    # New fields for production support (as per prompt)
+    enable_profiling: bool = Field(
+        False, description="Enable PyTorch profiler for performance analysis"
+    )
+    profiler_trace_path: str = Field(
+        "traces/", description="Path to save profiler traces"
+    )
+    enable_anomaly_detection: bool = Field(
+        False, description="Enable PyTorch anomaly detection (slow!)"
+    )
+    checkpoint_metric: str = Field(
+        "mean_episode_reward",
+        description="Metric to use for best checkpoint selection"
+    )
+
     class Config:
         """Pydantic config class to forbid extra fields."""
 
         extra = "forbid"
+
+    # As per prompt, a validator for learning_rate, gamma, gae_lambda, clip_epsilon
+    # to be in (0, 1]. The Field definitions already cover this (gt=0, le=1).
+    # If a single validator function is desired, it can be implemented like this:
+    @validator("learning_rate", "gamma", "gae_lambda", "clip_epsilon", always=True)
+    def validate_positive_float_in_range(cls, v, field):
+        """Ensure critical hyperparameters are in valid (0, 1] range."""
+        if not (0 < v <= 1):
+            # This should ideally not be hit if Field definitions are correct
+            # but serves as an additional check or if Field defs were less strict.
+            raise ValueError(f"{field.name} must be in (0, 1], got {v}")
+        return v
+
+    @validator("batch_size")
+    def validate_batch_size(cls, v):
+        """Ensure batch size is power of 2 for GPU efficiency."""
+        if v <= 0: # batch_size must be positive, Field(gt=0) already ensures this.
+             raise ValueError(f"batch_size must be positive, got {v}")
+        if v & (v - 1) != 0: # Check if not a power of 2
+            # Round up to next power of 2
+            new_v = 2 ** math.ceil(math.log2(v))
+            logger.warning(
+                "Batch size %d is not a power of 2. Rounding to %d for GPU efficiency.",
+                v, new_v
+            )
+            return new_v
+        return v
 
     @validator("device", pre=True, always=True)
     def set_device_auto(cls, v):
