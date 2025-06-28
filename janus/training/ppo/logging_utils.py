@@ -6,7 +6,6 @@ Logging utilities for Janus PPO training.
 
 import logging
 from pathlib import Path
-from typing import Optional, Dict
 from torch.utils.tensorboard import SummaryWriter
 
 try:
@@ -16,27 +15,39 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
-def setup_logging(name: str, checkpoint_dir: Path, use_tensorboard: bool, use_wandb: bool, config: dict) -> Dict[str, Optional[object]]:
-    loggers = {}
+def setup_logging(experiment_name, checkpoint_dir, use_tensorboard=True, use_wandb=False, config_dict=None):
+    """
+    Set up logging infrastructure for the training process.
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if use_tensorboard:
-        loggers["writer"] = SummaryWriter(log_dir=f"runs/{name}")
-    else:
-        loggers["writer"] = None
+    Args:
+        experiment_name (str): Name of the experiment for organizing logs.
+        checkpoint_dir (Path): Directory to store logs and checkpoints.
+        use_tensorboard (bool): Whether to use TensorBoard logging.
+        use_wandb (bool): Whether to use Weights & Biases logging.
+        config_dict (dict): Configuration dictionary to log to W&B.
+
+    Returns:
+        dict: Contains TensorBoard writer, CSV logger, and optional W&B setup.
+    """
+    log_dir = checkpoint_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    writer = SummaryWriter(log_dir=log_dir) if use_tensorboard else None
+
+    # Setup CSV logger
+    csv_log_path = log_dir / "training_log.csv"
+    csv_logger = logging.getLogger("csv_logger")
+    csv_logger.setLevel(logging.INFO)
+    csv_handler = logging.FileHandler(csv_log_path, mode='a', encoding='utf-8')
+    csv_handler.setFormatter(logging.Formatter('%(message)s'))
+    if csv_logger.hasHandlers():
+        csv_logger.handlers.clear()
+    csv_logger.addHandler(csv_handler)
 
     if use_wandb and WANDB_AVAILABLE:
-        wandb.init(project="janus-ppo", name=name, config=config)
-        loggers["wandb"] = wandb
-    else:
-        loggers["wandb"] = None
+        wandb.init(project=experiment_name, config=config_dict or {})
 
-    csv_logger = logging.getLogger(f"{name}_csv")
-    csv_handler = logging.FileHandler(checkpoint_dir / "metrics.csv")
-    csv_handler.setFormatter(logging.Formatter("%(message)s"))
-    csv_logger.addHandler(csv_handler)
-    csv_logger.setLevel(logging.INFO)
-    csv_logger.info("update,global_step,mean_reward,policy_loss,value_loss,entropy,kl_div,learning_rate")
-    loggers["csv"] = csv_logger
-
-    return loggers
+    return {
+        "writer": writer,
+        "csv": csv_logger
+    }
