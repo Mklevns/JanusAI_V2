@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any
-import numpy as np
 import logging
+import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class EarlyStoppingCallback(Callback):
         if self.patience_counter >= self.patience:
             logger.info(
                 "Early stopping triggered. No improvement for %d updates.",
-                self.patience
+                self.patience,
             )
             trainer.should_stop = True
 
