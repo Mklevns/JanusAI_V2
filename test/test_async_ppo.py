@@ -49,51 +49,82 @@ class TestAsyncRolloutCollector:
         collector, envs = setup_collector
         
         action = envs[0].action_space.sample()
-        next_obs, reward, done, truncated = collector._step_env_safe(0, action)
+        # _step_env_safe now returns info as the 6th element
+        env_idx, next_obs, reward, done, truncated, info = collector._step_env_safe(0, action)
         
+        assert env_idx == 0
         assert next_obs.shape == (4,)
         assert isinstance(reward, float)
         assert isinstance(done, bool)
+        assert isinstance(info, dict)
         
     def test_step_env_safe_with_error(self, setup_collector):
         collector, envs = setup_collector
         
         # Mock environment to fail
         with patch.object(envs[0], 'step', side_effect=Exception("Test error")):
-            next_obs, reward, done, truncated = collector._step_env_safe(0, 0, max_retries=2)
+            # _step_env_safe now returns info as the 6th element
+            env_idx, next_obs, reward, done, truncated, info = collector._step_env_safe(0, 0, max_retries=2)
             
         # Should return last valid obs and done=True
+        assert env_idx == 0
         assert np.array_equal(next_obs, collector.last_valid_obs[0])
         assert reward == 0.0
         assert done == True
-        
-    def test_collect_steps_sync(self, setup_collector):
+        assert isinstance(info, dict)
+
+    def _get_dummy_actions_fn(self, collector_instance, envs_instance):
+        """Helper to create a dummy get_actions_fn for testing collector.collect."""
+        def get_actions_fn(obs_tensor):
+            # obs_tensor is (num_envs, obs_dim)
+            num_envs = obs_tensor.shape[0]
+            actions = np.array([envs_instance[i].action_space.sample() for i in range(num_envs)])
+            log_probs = np.zeros(num_envs) # Dummy log_probs
+            return actions, log_probs
+        return get_actions_fn
+
+    def test_collect_sync(self, setup_collector):
         collector, envs = setup_collector
         
-        actions = np.array([env.action_space.sample() for env in envs])
-        next_obs, rewards, dones, truncateds = collector.collect_steps(actions)
+        dummy_actions_fn = self._get_dummy_actions_fn(collector, envs)
+        # Call collect instead of collect_steps
+        # New return signature: original_obs, next_obs_tensor, rewards_tensor, dones_tensor, truncateds_tensor, log_probs_np, infos_list
+        original_obs, next_obs, rewards, dones, truncateds, log_probs, infos = collector.collect(dummy_actions_fn)
+
+        assert original_obs.shape == (4, 4) # num_envs, obs_dim
+        assert next_obs.shape == (4, 4) # This is a torch tensor
+        assert rewards.shape == (4,) # This is a torch tensor
+        assert dones.shape == (4,) # This is a torch tensor
+        assert truncateds.shape == (4,) # This is a torch tensor
+        assert log_probs.shape == (4,)
+        assert isinstance(infos, list)
+        assert len(infos) == 4
+        assert isinstance(infos[0], dict)
+
+    def test_collect_async(self, setup_collector):
+        collector, envs = setup_collector
         
+        dummy_actions_fn = self._get_dummy_actions_fn(collector, envs)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Call collect instead of collect_steps
+            original_obs, next_obs, rewards, dones, truncateds, log_probs, infos = collector.collect(dummy_actions_fn, executor)
+            
+        assert original_obs.shape == (4, 4)
         assert next_obs.shape == (4, 4)
         assert rewards.shape == (4,)
         assert dones.shape == (4,)
-        
-    def test_collect_steps_async(self, setup_collector):
-        collector, envs = setup_collector
-        
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            actions = np.array([env.action_space.sample() for env in envs])
-            next_obs, rewards, dones, truncateds = collector.collect_steps(actions, executor)
-            
-        assert next_obs.shape == (4, 4)
-        assert rewards.shape == (4,)
-        
+        assert truncateds.shape == (4,)
+        assert log_probs.shape == (4,)
+        assert isinstance(infos, list)
+        assert len(infos) == 4
+
     def test_episode_statistics(self, setup_collector):
         collector, envs = setup_collector
+        dummy_actions_fn = self._get_dummy_actions_fn(collector, envs)
         
         # Run some episodes
-        for _ in range(50):
-            actions = np.array([env.action_space.sample() for env in envs])
-            collector.collect_steps(actions)
+        for _ in range(50): # Each call to collect is one step for all envs
+            collector.collect(dummy_actions_fn)
             
         stats = collector.get_statistics()
         

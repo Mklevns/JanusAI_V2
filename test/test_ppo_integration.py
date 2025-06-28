@@ -109,12 +109,26 @@ class TestPPOComponents:
         assert collector.current_obs.shape[0] == 2
         
         # Test step collection
-        actions = np.array([0, 1])
-        next_obs, rewards, dones, truncateds = collector.collect_steps(actions)
+        def get_actions_fn(obs_tensor):
+            num_envs = obs_tensor.shape[0]
+            # SymbolicRegressionEnv has a Discrete action space
+            actions = np.array([envs[i].action_space.sample() for i in range(num_envs)])
+            log_probs = np.zeros(num_envs) # Dummy log_probs
+            return actions, log_probs
+
+        # Call collect instead of collect_steps
+        # New return signature: original_obs, next_obs_tensor, rewards_tensor, dones_tensor, truncateds_tensor, log_probs_np, infos_list
+        original_obs, next_obs, rewards, dones, truncateds, log_probs, infos = collector.collect(get_actions_fn)
         
-        assert next_obs.shape[0] == 2
-        assert rewards.shape == (2,)
-        assert dones.shape == (2,)
+        assert original_obs.shape[0] == 2
+        assert next_obs.shape[0] == 2 # torch.Tensor
+        assert rewards.shape == (2,) # torch.Tensor
+        assert dones.shape == (2,) # torch.Tensor
+        assert truncateds.shape == (2,) # torch.Tensor
+        assert log_probs.shape == (2,)
+        assert isinstance(infos, list)
+        assert len(infos) == 2
+        assert isinstance(infos[0], dict)
 
 
 class TestPPOIntegration:
