@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "analysisLevel": "strict",
+  "framework": "pytorch",
+  "ignoreRules": [
+    "E501"
+  ],
+  "customRules": {
+    "enabled": true,
+    "tags": [
+      "security",
+      "ml",
+      "performance",
+      "reproducibility"
+    ]
+  },
+  "notifications": {
+    "showSummary": true,
+    "autoFix": true
+  },
+  "integration": {
+    "serverUrl": "https://codeguard.replit.app",
+    "timeout": 30000,
+    "retries": 2
+  }
+}
