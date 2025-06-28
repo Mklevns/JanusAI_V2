@@ -2,10 +2,9 @@
 """
 PPO Trainer for Proximal Policy Optimization (PPO) in JanusAI V2.
 
-This module implements a production-ready PPO trainer that manages the training loop,
-handles rollouts, normalizes rewards, and integrates with logging systems like
-TensorBoard and Weights & Biases. It is designed to be robust, configurable,
-and suitable for production-scale research.
+This module implements a PPO trainer that manages the training loop,
+handles rollouts, normalizes rewards, and integrates w/
+TensorBoard and Weights & Biases.
 
 Features:
     - Asynchronous rollout collection with multiple environments
@@ -22,18 +21,15 @@ Features:
 # Includes reproducibility seeding, cleaned imports, best practices
 
 import logging
-import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 
 from janus.rewards import RewardHandler
@@ -59,18 +55,22 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+
 class PPOTrainer:
     """
     Production-ready PPO trainer with advanced features.
-    
+
     This trainer orchestrates the entire PPO training process including:
     - Asynchronous environment stepping
     - Advantage estimation with GAE
     - Policy and value network updates
     - Hyperparameter scheduling
     - Comprehensive logging and checkpointing
+    - Mixed precision training (AMP) and gradient accumulation
+    - Safe GPU memory management and checkpointing
     """
-    
+
     def __init__(
         self,
         agent,
@@ -80,125 +80,79 @@ class PPOTrainer:
         checkpoint_dir: Optional[Path] = None,
         use_tensorboard: bool = True,
         use_wandb: bool = False,
-        eval_env: Optional[Any] = None
+        eval_env: Optional[Any] = None,
     ):
-        """
-        Initialize the PPO trainer.
-        
-        Args:
-            agent: PPO agent with actor and critic networks
-            envs: List of training environments
-            config: PPO configuration object
-            experiment_name: Name for the experiment
-            checkpoint_dir: Directory for saving checkpoints
-            use_tensorboard: Whether to use TensorBoard
-            use_wandb: Whether to use Weights & Biases
-            eval_env: Optional evaluation environment
-        """
         self.agent = agent
+        self.envs = envs
         self.config = config
         self.eval_env = eval_env
         self.experiment_name = experiment_name
 
-        # Device setup
         self.device = torch.device(config.device)
         self.agent.to(self.device)
         logger.info("Using device: %s", self.device)
 
-        # Environment setup
-        self.envs = envs
         self.n_envs = len(envs)
-
-        # Get environment specifications
         dummy_obs, _ = envs[0].reset()
         self.obs_shape = dummy_obs.shape
 
-        # Detect action space type
         if hasattr(envs[0].action_space, "n"):
-            # Discrete action space
             self.action_shape = ()
             self.action_dim = envs[0].action_space.n
             self.continuous_actions = False
         else:
-            # Continuous action space
             self.action_shape = envs[0].action_space.shape
             self.action_dim = envs[0].action_space.shape[0]
             self.continuous_actions = True
 
         logger.info(
             "Environment: obs_shape=%s, action_dim=%s, continuous=%s",
-            self.obs_shape, self.action_dim, self.continuous_actions
+            self.obs_shape,
+            self.action_dim,
+            self.continuous_actions,
         )
 
-        # Async rollout collector
         self.collector = AsyncRolloutCollector(
             envs, self.device, config.num_workers, config.use_subprocess_envs
         )
-
-        # Thread pool for async operations
-        if config.num_workers > 1:
-            self.executor = ThreadPoolExecutor(max_workers=config.num_workers)
-        else:
-            self.executor = None
-
-        # Buffer will be initialized in train()
+        self.executor = (
+            ThreadPoolExecutor(max_workers=config.num_workers)
+            if config.num_workers > 1
+            else None
+        )
         self.buffer = None
-
-        # Initialize attribute for current values
         self._current_values = None
 
-        # Reward normalization
         self.reward_normalizer = RunningMeanStd() if config.normalize_rewards else None
 
-        # Optimizer setup
         self.optimizer = torch.optim.Adam(
             agent.parameters(), lr=config.learning_rate, eps=1e-5
         )
-
-        # Mixed precision setup
         self.scaler = (
             GradScaler()
             if config.use_mixed_precision and self.device.type == "cuda"
             else None
         )
 
-        # Training state
         self.global_step = 0
         self.num_updates = 0
         self.best_mean_reward = -np.inf
         self.best_eval_reward = -np.inf
-        # Reward handler setup
-        self.reward_handler = reward_handler
+
+        self.reward_handler = None  # Placeholder for future reward handler integration
         self.debug_rewards = getattr(config, "debug_rewards", False)
 
-        # If reward handler provided, log its configuration
-        if self.reward_handler is not None:
-            logger.info(
-                "Using RewardHandler with %d components:", len(self.reward_handler.components)
-            )
-            for comp, weight in zip(
-                self.reward_handler.components, self.reward_handler.weights
-            ):
-                logger.info("  - %s: weight=%s", comp.__class__.__name__, weight)
-        else:
-            logger.info("Using raw environment rewards (no RewardHandler)")
-
-        # Track reward component statistics
-        self.reward_component_stats = {}
-        # Setup logging and checkpointing
         self.checkpoint_dir = checkpoint_dir or Path(f"checkpoints/{experiment_name}")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save initial config
         config.to_yaml(self.checkpoint_dir / "config.yaml")
 
-        # Setup loggers
         self.loggers = setup_logging(
             experiment_name,
             self.checkpoint_dir,
             use_tensorboard,
             use_wandb,
-            asdict(config),
+            dict(config),
         )
         self.writer = self.loggers["writer"]
         self.csv_logger = self.loggers["csv"]
@@ -209,132 +163,125 @@ class PPOTrainer:
             config.num_workers,
         )
 
-    def _schedule_hyperparam(
-        self, initial_value: float, end_value: float, schedule: str, progress: float
-    ) -> float:
+    def evaluate(
+        self,
+        eval_env: Optional[Any] = None,
+        num_episodes: int = 10,
+        render: bool = False,
+    ) -> Dict[str, float]:
         """
-        Calculate scheduled hyperparameter value.
+        Evaluate the agent on the evaluation environment.
 
         Args:
-            initial_value: Starting value
-            end_value: Final value
-            schedule: Schedule type ('constant', 'linear', 'cosine')
-            progress: Training progress [0, 1]
+            eval_env: Environment to evaluate on (uses self.eval_env if None)
+            num_episodes: Number of episodes to run
+            render: Whether to render the environment
 
         Returns:
-            Scheduled value
+            Dictionary of evaluation metrics
         """
-        if schedule == "constant":
-            return initial_value
-        elif schedule == "linear":
-            return initial_value + (end_value - initial_value) * progress
-        elif schedule == "cosine":
-            return end_value + (initial_value - end_value) * 0.5 * (
-                1 + np.cos(np.pi * progress)
-            )
-        else:
-            raise ValueError(f"Unknown schedule: {schedule}")
+        env = eval_env or self.eval_env
+        if env is None:
+            logger.warning("No evaluation environment provided")
+            return {"eval_reward": 0.0}
+
+        self.agent.eval()  # Set model to eval mode for inference only
+
+        episode_rewards = np.zeros(num_episodes, dtype=np.float32)
+        episode_lengths = np.zeros(num_episodes, dtype=np.int32)
+
+        for ep in range(num_episodes):
+            obs, _ = env.reset()
+            done = False
+            reward_sum = 0
+            step_count = 0
+
+            while not done:
+                if render:
+                    env.render()
+
+                obs_tensor = torch.tensor(
+                    obs, dtype=torch.float32, device=self.device
+                ).unsqueeze(
+                    0
+                )  # device-safe tensor conversion
+
+                with torch.no_grad():
+                    action, _ = self.agent.act(obs_tensor, deterministic=True)
+
+                if self.continuous_actions:
+                    action_np = action.cpu().numpy()[0]
+                else:
+                    action_np = action.cpu().numpy()[0].item()
+
+                obs, reward, done, truncated, _ = env.step(action_np)
+                reward_sum += reward
+                step_count += 1
+
+                if truncated:
+                    done = True
+
+            episode_rewards[ep] = reward_sum
+            episode_lengths[ep] = step_count
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear unused GPU memory post-eval
+
+        return {
+            "eval_reward": episode_rewards.mean(),
+            "eval_reward_std": episode_rewards.std(),
+            "eval_length": episode_lengths.mean(),
+        }
 
     def collect_rollouts(self, num_steps: int) -> Dict[str, float]:
         """
-        Collect rollouts from environments with modular reward computation.
+        Collect rollouts from environments for PPO.
+
+        Args:
+            num_steps: Number of steps to collect per environment
 
         Returns:
-            Dictionary of statistics including collection time, reward components.
+            Dictionary of collection statistics
         """
-        import time
-
         self.buffer.clear()
-        collection_start = time.time()
+        start_time = time.time()
 
-        component_rewards_sum: Dict[str, float] = {}
-        component_rewards_count: int = 0
-
-        self._current_values = None  # Initialize attribute outside loop
-        cached_actions = {}  # Promote to method scope for closure access
+        self._current_values = None
+        cached_actions = {}
 
         for step in range(num_steps):
+
             def get_actions_fn(obs_tensor):
                 with torch.no_grad():
                     if self.scaler:
-                        with autocast():
+                        with torch.cuda.amp.autocast():
                             actions, log_probs = self.agent.act(obs_tensor)
                             values = self.agent.critic(obs_tensor).squeeze(-1)
                     else:
                         actions, log_probs = self.agent.act(obs_tensor)
                         values = self.agent.critic(obs_tensor).squeeze(-1)
-
                 self._current_values = values.cpu().numpy()
-                cached_actions['actions'] = actions.cpu().numpy()
-                cached_actions['log_probs'] = log_probs.cpu().numpy()
-                return cached_actions['actions'], cached_actions['log_probs']
+                cached_actions["actions"] = actions.cpu().numpy()
+                cached_actions["log_probs"] = log_probs.cpu().numpy()
+                return cached_actions["actions"], cached_actions["log_probs"]
 
-            (original_obs, next_obs, env_rewards, dones, truncateds,
-             log_probs, infos) = self.collector.collect(get_actions_fn, self.executor)
-
-            values_np = self._current_values
-            actions_np = cached_actions['actions']
-
-            if self.reward_handler is not None:
-                modular_rewards = np.zeros(self.n_envs, dtype=np.float32)
-                for env_idx in range(self.n_envs):
-                    info = infos[env_idx] or {}
-                    modular_rewards[env_idx] = self.reward_handler.compute_reward(
-                        observation=original_obs[env_idx],
-                        action=actions_np[env_idx],
-                        next_observation=next_obs[env_idx],
-                        info=info,
-                    )
-                    if self.debug_rewards and step % 100 == 0:
-                        breakdown = self.reward_handler.get_component_breakdown(
-                            original_obs[env_idx],
-                            actions_np[env_idx],
-                            next_obs[env_idx],
-                            info,
-                        )
-                        for comp_name, comp_reward in breakdown.items():
-                            component_rewards_sum.setdefault(comp_name, 0.0)
-                            component_rewards_sum[comp_name] += comp_reward
-                        component_rewards_count += 1
-                rewards = modular_rewards
-            else:
-                rewards = env_rewards
-
-            if self.reward_normalizer is not None:
-                self.reward_normalizer.update(rewards.reshape(-1, 1))
-                normalized_rewards = rewards / np.sqrt(self.reward_normalizer.var + 1e-8)
-            else:
-                normalized_rewards = rewards
-
-            self.buffer.add(
-                obs=original_obs,
-                action=actions_np,
-                reward=normalized_rewards,
-                done=dones,
-                value=values_np,
-                log_prob=log_probs,
+            obs, next_obs, rewards, dones, truncateds, log_probs, infos = (
+                self.collector.collect(get_actions_fn, self.executor)
             )
 
-            if self.reward_handler is not None:
-                for env_idx in range(self.n_envs):
-                    if dones[env_idx] or truncateds[env_idx]:
-                        self.reward_handler.reset()
-                        break
+            values_np = self._current_values
+            actions_np = cached_actions["actions"]
 
+            if self.reward_normalizer:
+                self.reward_normalizer.update(rewards.reshape(-1, 1))
+                rewards = rewards / np.sqrt(self.reward_normalizer.var + 1e-8)
+
+            self.buffer.add(obs, actions_np, rewards, dones, values_np, log_probs)
             self.global_step += self.n_envs
 
-        collection_time = time.time() - collection_start
         stats = self.collector.get_statistics()
-        stats['collection_time'] = collection_time
-        stats['steps_per_second'] = (num_steps * self.n_envs) / collection_time
-
-        if self.debug_rewards and component_rewards_count > 0:
-            for comp_name, total in component_rewards_sum.items():
-                stats[f'reward_component/{comp_name}'] = total / component_rewards_count
-
-        return stats
-
-
+        stats["collection_time"] = time.time() - start_time
+        stats["steps_per_second"] = (num_steps * self.n_envs) / stats["collection_time"]
 
     def compute_gae(
         self,
@@ -353,8 +300,7 @@ class PPOTrainer:
             last_values: Bootstrap values [n_envs]
 
         Returns:
-            advantages: GAE advantages
-            returns: Target values for value function
+            Tuple of (advantages, returns)
         """
         n_steps, n_envs = rewards.shape
         advantages = torch.zeros_like(rewards)
@@ -384,38 +330,29 @@ class PPOTrainer:
         returns = advantages + values
         return advantages, returns
 
-    def learn(
-        self, current_clip_epsilon: float, current_entropy_coef: float
-    ) -> Dict[str, float]:
+    def learn(self, current_clip_epsilon: float, current_entropy_coef: float) -> Dict[str, float]:
         """
-        Update policy and value networks using PPO.
+        Perform PPO update from collected rollouts.
 
         Args:
-            current_clip_epsilon: Current clipping parameter
-            current_entropy_coef: Current entropy coefficient
+            current_clip_epsilon: Current clip ratio for PPO
+            current_entropy_coef: Current entropy bonus coefficient
 
         Returns:
-            Dictionary of training metrics
+            Training metrics
         """
         learn_start = time.time()
         data = self.buffer.get()
 
-        # Compute advantages
         with torch.no_grad():
-            # Get values for last observation (for bootstrapping)
-            last_obs = torch.FloatTensor(self.collector.current_obs).to(self.device)
-            if self.scaler:
-                with autocast():
-                    last_values = self.agent.critic(last_obs).squeeze(-1)
-            else:
-                last_values = self.agent.critic(last_obs).squeeze(-1)
+            obs_tensor = torch.tensor(self.collector.current_obs, dtype=torch.float32, device=self.device)
+            last_values = self.agent.critic(obs_tensor).squeeze(-1)
 
             advantages, returns = self.compute_gae(
                 data["rewards"], data["values"], data["dones"], last_values
             )
 
-        # Flatten batch dimensions for training
-        def flatten(tensor: torch.Tensor) -> torch.Tensor:
+        def flatten(tensor):
             return tensor.swapaxes(0, 1).reshape(-1, *tensor.shape[2:])
 
         b_obs = flatten(data["observations"])
@@ -424,42 +361,21 @@ class PPOTrainer:
         b_advantages = flatten(advantages).squeeze()
         b_returns = flatten(returns).squeeze()
 
-        # Normalize advantages
         if self.config.normalize_advantages:
-            b_advantages = (b_advantages - b_advantages.mean()) / (
-                b_advantages.std() + 1e-8
-            )
+            b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-        # Training metrics
-        pg_losses, value_losses, entropy_losses, kl_divs, clip_fractions = (
-            [],
-            [],
-            [],
-            [],
-            [],
-        )
+        pg_losses, value_losses, entropy_losses, kl_divs, clip_fractions = [], [], [], [], []
+        total_batch_size = self.config.batch_size * self.config.gradient_accumulation_steps
 
-        # Calculate total batch size considering gradient accumulation
-        total_batch_size = (
-            self.config.batch_size * self.config.gradient_accumulation_steps
-        )
-
-        # Training epochs
         for epoch in range(self.config.n_epochs):
-            # Shuffle indices for each epoch
             indices = np.random.permutation(b_obs.shape[0])
-
-            # Gradient accumulation counter
             accumulation_counter = 0
 
             for start_idx in range(0, b_obs.shape[0], self.config.batch_size):
-                batch_indices = indices[start_idx : start_idx + self.config.batch_size]
-
-                # Skip incomplete batches
+                batch_indices = indices[start_idx:start_idx + self.config.batch_size]
                 if len(batch_indices) < self.config.batch_size // 2:
                     continue
 
-                # Forward pass
                 try:
                     if self.scaler:
                         with autocast():
@@ -472,46 +388,24 @@ class PPOTrainer:
                         )
 
                     values = values.squeeze()
-
-                    # PPO losses
                     ratio = torch.exp(log_probs - b_log_probs[batch_indices])
                     surr1 = ratio * b_advantages[batch_indices]
-                    surr2 = (
-                        torch.clamp(
-                            ratio, 1 - current_clip_epsilon, 1 + current_clip_epsilon
-                        )
-                        * b_advantages[batch_indices]
-                    )
+                    surr2 = torch.clamp(ratio, 1 - current_clip_epsilon, 1 + current_clip_epsilon) * b_advantages[batch_indices]
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                    # Value loss (consider clipped value loss)
-                    value_pred_clipped = data["values"].flatten()[
-                        batch_indices
-                    ] + torch.clamp(
+                    value_pred_clipped = data["values"].flatten()[batch_indices] + torch.clamp(
                         values - data["values"].flatten()[batch_indices],
                         -current_clip_epsilon,
                         current_clip_epsilon,
                     )
-                    value_losses_clipped = (
-                        value_pred_clipped - b_returns[batch_indices]
-                    ) ** 2
-                    value_losses_unclipped = (values - b_returns[batch_indices]) ** 2
-                    value_loss = (
-                        0.5
-                        * torch.max(value_losses_clipped, value_losses_unclipped).mean()
-                    )
+                    value_loss = 0.5 * torch.max(
+                        (value_pred_clipped - b_returns[batch_indices]) ** 2,
+                        (values - b_returns[batch_indices]) ** 2
+                    ).mean()
 
-                    # Total loss
-                    loss = (
-                        policy_loss
-                        + self.config.value_coef * value_loss
-                        - current_entropy_coef * entropy.mean()
-                    )
+                    loss = policy_loss + self.config.value_coef * value_loss - current_entropy_coef * entropy.mean()
+                    loss /= self.config.gradient_accumulation_steps
 
-                    # Scale loss for gradient accumulation
-                    loss = loss / self.config.gradient_accumulation_steps
-
-                    # Backward pass
                     if self.scaler:
                         self.scaler.scale(loss).backward()
                     else:
@@ -519,156 +413,141 @@ class PPOTrainer:
 
                     accumulation_counter += 1
 
-                    # Optimizer step after accumulation
-                    if (
-                        accumulation_counter % self.config.gradient_accumulation_steps
-                        == 0
-                    ):
+                    if accumulation_counter % self.config.gradient_accumulation_steps == 0:
                         if self.scaler:
                             self.scaler.unscale_(self.optimizer)
-                            nn.utils.clip_grad_norm_(
-                                self.agent.parameters(), self.config.max_grad_norm
-                            )
+                            nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
-                            nn.utils.clip_grad_norm_(
-                                self.agent.parameters(), self.config.max_grad_norm
-                            )
+                            nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
                             self.optimizer.step()
 
                         self.optimizer.zero_grad()
 
-                    # Track metrics
                     with torch.no_grad():
-                        pg_losses.append(
-                            policy_loss.item() * self.config.gradient_accumulation_steps
-                        )
+                        pg_losses.append(policy_loss.item() * self.config.gradient_accumulation_steps)
                         value_losses.append(value_loss.item())
                         entropy_losses.append(entropy.mean().item())
-                        kl_div = (b_log_probs[batch_indices] - log_probs).mean().item()
-                        kl_divs.append(kl_div)
-                        clip_fraction = (
-                            (torch.abs(ratio - 1) > current_clip_epsilon)
-                            .float()
-                            .mean()
-                            .item()
-                        )
-                        clip_fractions.append(clip_fraction)
+                        kl_divs.append((b_log_probs[batch_indices] - log_probs).mean().item())
+                        clip_fractions.append((torch.abs(ratio - 1) > current_clip_epsilon).float().mean().item())
 
                 except Exception as e:
-                    logger.error(f"Error in training step: {e}", exc_info=True)
+                    logger.error(f"Training error at epoch {epoch}: {e}", exc_info=True)
                     continue
 
-            # Early stopping based on KL divergence
             mean_kl = np.mean(kl_divs) if kl_divs else 0
-            if self.config.target_kl is not None and mean_kl > self.config.target_kl:
-                logger.info(
-                    f"Early stopping at epoch {epoch+1} due to high KL divergence: {mean_kl:.4f}"
-                )
+            if self.config.target_kl and mean_kl > self.config.target_kl:
+                logger.info(f"Early stopping at epoch {epoch} due to KL={mean_kl:.4f}")
                 break
 
-        # Compute explained variance
         with torch.no_grad():
             y_pred = data["values"].flatten()
             y_true = returns.flatten()
-            var_y = torch.var(y_true)
-            explained_var = 1 - torch.var(y_true - y_pred) / (var_y + 1e-8)
+            explained_var = 1 - torch.var(y_true - y_pred) / (torch.var(y_true) + 1e-8)
 
-        learn_time = time.time() - learn_start
+            return {
+                "policy_loss": np.mean(pg_losses),
+                "value_loss": np.mean(value_losses),
+                "entropy": np.mean(entropy_losses),
+                "kl_divergence": np.mean(kl_divs),
+                "clip_fraction": np.mean(clip_fractions),
+                "explained_variance": explained_var.item(),
+                "learn_time": time.time() - learn_start,
+            }
+    
+        def train(self, total_timesteps: int, rollout_length: int = 2048):
+            """
+            Main PPO training loop.
+    
+            Args:
+                total_timesteps: Total steps to train on
+                rollout_length: Number of env steps per rollout
+            """
+            self.buffer = RolloutBuffer(
+                buffer_size=rollout_length,
+                obs_shape=self.obs_shape,
+                action_shape=self.action_shape,
+                device=self.device,
+                n_envs=self.n_envs,
+            )
+    
+            num_updates = total_timesteps // (rollout_length * self.n_envs)
+            logger.info(f"Starting PPO training: {num_updates} updates, {total_timesteps} steps")
+            start_time = time.time()
+    
+            for update in range(1, num_updates + 1):
+                self.num_updates = update
+                progress = update / num_updates
+    
+                lr = self._schedule_hyperparam(self.config.learning_rate, self.config.lr_end, self.config.lr_schedule, progress)
+                clip_eps = self._schedule_hyperparam(self.config.clip_epsilon, self.config.clip_end, self.config.clip_schedule, progress)
+                entropy_coef = self._schedule_hyperparam(self.config.entropy_coef, self.config.entropy_end, self.config.entropy_schedule, progress)
+    
+                for group in self.optimizer.param_groups:
+                    group["lr"] = lr
+    
+                rollout_metrics = self.collect_rollouts(rollout_length)
+                learn_metrics = self.learn(clip_eps, entropy_coef)
+    
+                all_metrics = {
+                    **rollout_metrics,
+                    **learn_metrics,
+                    "learning_rate": lr,
+                    "clip_epsilon": clip_eps,
+                    "entropy_coef": entropy_coef,
+                    "update_time": time.time() - start_time,
+                }
+    
+                if update % self.config.log_interval == 0:
+                    logger.info(f"Update {update}: Reward {all_metrics.get('mean_episode_reward', 0):.2f} | KL {all_metrics['kl_divergence']:.4f}")
+                    self._log_metrics(all_metrics)
+    
+                if update % self.config.save_interval == 0:
+                    self.save_checkpoint()
+    
+                if self.eval_env and update % self.config.eval_interval == 0:
+                    eval_metrics = self.evaluate(num_episodes=10)
+                    logger.info(f"Eval @ Update {update}: Reward {eval_metrics['eval_reward']:.2f} ± {eval_metrics['eval_reward_std']:.2f}")
+                    self._log_metrics(eval_metrics, prefix="eval")
+    
+                    if eval_metrics["eval_reward"] > self.best_eval_reward:
+                        self.best_eval_reward = eval_metrics["eval_reward"]
+                        self.save_checkpoint(is_best=True)
+    
+                if all_metrics.get("mean_episode_reward", -np.inf) > self.best_mean_reward:
+                    self.best_mean_reward = all_metrics["mean_episode_reward"]
+                    if not self.eval_env:
+                        self.save_checkpoint(is_best=True)
+    
+            logger.info("Training complete")
+            self.save_checkpoint(self.checkpoint_dir / "final_model.pt")
+            if self.writer:
+                self.writer.close()
+            if self.executor:
+                self.executor.shutdown(wait=True)
 
-        metrics = {
-            "policy_loss": np.mean(pg_losses) if pg_losses else 0,
-            "value_loss": np.mean(value_losses) if value_losses else 0,
-            "entropy": np.mean(entropy_losses) if entropy_losses else 0,
-            "kl_divergence": np.mean(kl_divs) if kl_divs else 0,
-            "clip_fraction": np.mean(clip_fractions) if clip_fractions else 0,
-            "explained_variance": explained_var.item(),
-            "learn_time": learn_time,
-            "epochs_trained": epoch + 1,
-        }
+    def _schedule_hyperparam(self, initial: float, final: float, mode: str, progress: float) -> float:
+        if mode == "constant":
+            return initial
+        elif mode == "linear":
+            return initial + (final - initial) * progress
+        elif mode == "cosine":
+            return final + (initial - final) * 0.5 * (1 + np.cos(np.pi * progress))
+        else:
+            raise ValueError(f"Unsupported schedule type: {mode}")
 
-        return metrics
+    def _log_metrics(self, metrics: Dict[str, float], prefix: str = "train"):
+        if self.writer:
+            for k, v in metrics.items():
+                self.writer.add_scalar(f"{prefix}/{k}", v, self.global_step)
+        if WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=self.global_step)
 
-    def evaluate(
-        self,
-        eval_env: Optional[Any] = None,
-        num_episodes: int = 10,
-        render: bool = False,
-    ) -> Dict[str, float]:
-        """
-        Evaluate the agent on the evaluation environment.
-
-        Args:
-            eval_env: Environment to evaluate on (uses self.eval_env if None)
-            num_episodes: Number of episodes to run
-            render: Whether to render the environment
-
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        env = eval_env or self.eval_env
-        if env is None:
-            logger.warning("No evaluation environment provided")
-            return {"eval_reward": 0.0}
-
-        episode_rewards = []
-        episode_lengths = []
-
-        for ep in range(num_episodes):
-            obs, _ = env.reset()
-            done = False
-            episode_reward = 0
-            episode_length = 0
-
-            while not done:
-                if render:
-                    env.render()
-
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-
-                with torch.no_grad():
-                    action, _ = self.agent.act(obs_tensor, deterministic=True)
-
-                if self.continuous_actions:
-                    action_np = action.cpu().numpy()[0]
-                else:
-                    action_np = action.cpu().numpy()[0].item()
-
-                obs, reward, done, truncated, _ = env.step(action_np)
-                episode_reward += reward
-                episode_length += 1
-
-                if truncated:
-                    done = True
-
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(episode_length)
-
-        return {
-            "eval_reward": np.mean(episode_rewards),
-            "eval_reward_std": np.std(episode_rewards),
-            "eval_length": np.mean(episode_lengths),
-        }
-
-    def save_checkpoint(
-        self, path: Optional[Path] = None, is_best: bool = False
-    ) -> Path:
-        """
-        Save training checkpoint.
-
-        Args:
-            path: Path to save checkpoint (auto-generated if None)
-            is_best: Whether this is the best model so far
-
-        Returns:
-            Path where checkpoint was saved
-        """
+    def save_checkpoint(self, path: Optional[Path] = None, is_best: bool = False) -> Path:
         if path is None:
-            if is_best:
-                path = self.checkpoint_dir / "best_model.pt"
-            else:
-                path = self.checkpoint_dir / f"checkpoint_{self.global_step}.pt"
+            name = "best_model.pt" if is_best else f"checkpoint_{self.global_step}.pt"
+            path = self.checkpoint_dir / name
 
         checkpoint = {
             "global_step": self.global_step,
@@ -679,212 +558,25 @@ class PPOTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": asdict(self.config),
         }
-
-        # Add optional components
-        if self.reward_normalizer is not None:
-            checkpoint["reward_normalizer"] = self.reward_normalizer
-        if self.scaler is not None:
+        if self.scaler:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
+        if self.reward_normalizer:
+            checkpoint["reward_normalizer"] = self.reward_normalizer
 
         torch.save(checkpoint, path)
-        logger.info(f"{'Best ' if is_best else ''}Checkpoint saved to {path}")
-
+        logger.info(f"Checkpoint saved to {path}")
         return path
 
-    def load_checkpoint(self, path: Path) -> Dict[str, Any]:
-        """
-        Load training checkpoint.
-
-        Args:
-            path: Path to checkpoint file
-
-        Returns:
-            Checkpoint dictionary
-        """
+    def load_checkpoint(self, path: Path):
         checkpoint = torch.load(path, map_location=self.device)
-
         self.agent.load_state_dict(checkpoint["agent_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.global_step = checkpoint["global_step"]
-        self.num_updates = checkpoint.get("num_updates", 0)
+        self.num_updates = checkpoint["num_updates"]
         self.best_mean_reward = checkpoint.get("best_mean_reward", -np.inf)
         self.best_eval_reward = checkpoint.get("best_eval_reward", -np.inf)
-
-        if "reward_normalizer" in checkpoint and self.config.normalize_rewards:
-            self.reward_normalizer = checkpoint["reward_normalizer"]
-
-        if self.scaler is not None and "scaler_state_dict" in checkpoint:
+        if "scaler_state_dict" in checkpoint and self.scaler:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-        logger.info(f"Checkpoint loaded from {path} (step {self.global_step})")
-
-        return checkpoint
-
-    def _log_metrics(self, metrics: Dict[str, float], prefix: str = "train"):
-        """
-        Log metrics to all configured backends.
-
-        Args:
-            metrics: Dictionary of metrics to log
-            prefix: Prefix for metric names
-        """
-        # TensorBoard
-        if self.writer is not None:
-            for key, value in metrics.items():
-                self.writer.add_scalar(f"{prefix}/{key}", value, self.global_step)
-
-        # Weights & Biases
-        if WANDB_AVAILABLE and wandb.run is not None:
-            wandb_metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
-            wandb_metrics["global_step"] = self.global_step
-            wandb.log(wandb_metrics)
-
-        # CSV logging for training metrics
-        if prefix == "train" and self.csv_logger is not None:
-            self.csv_logger.info(
-                f"{self.num_updates},{self.global_step},"
-                f"{metrics.get('mean_episode_reward', 0):.2f},"
-                f"{metrics.get('policy_loss', 0):.4f},"
-                f"{metrics.get('value_loss', 0):.4f},"
-                f"{metrics.get('entropy', 0):.4f},"
-                f"{metrics.get('kl_divergence', 0):.4f},"
-                f"{metrics.get('learning_rate', 0):.6f}"
-            )
-
-    def train(self, total_timesteps: int, rollout_length: int = 2048):
-        """
-        Main training loop.
-
-        Args:
-            total_timesteps: Total environment steps to train for
-            rollout_length: Steps to collect per rollout
-        """
-        # Initialize buffer
-        self.buffer = RolloutBuffer(
-            buffer_size=rollout_length,
-            obs_shape=self.obs_shape,
-            action_shape=self.action_shape,
-            device=self.device,
-            n_envs=self.n_envs,
-        )
-
-        num_updates = total_timesteps // (rollout_length * self.n_envs)
-
-        logger.info(
-            f"Starting training for {total_timesteps} timesteps ({num_updates} updates)"
-        )
-        logger.info(f"Rollout length: {rollout_length}, Environments: {self.n_envs}")
-
-        start_time = time.time()
-
-        try:
-            for update in range(1, num_updates + 1):
-                self.num_updates = update
-                update_start_time = time.time()
-                progress = update / num_updates
-
-                # Schedule hyperparameters
-                lr = self._schedule_hyperparam(
-                    self.config.learning_rate,
-                    self.config.lr_end,
-                    self.config.lr_schedule,
-                    progress,
-                )
-                clip_epsilon = self._schedule_hyperparam(
-                    self.config.clip_epsilon,
-                    self.config.clip_end,
-                    self.config.clip_schedule,
-                    progress,
-                )
-                entropy_coef = self._schedule_hyperparam(
-                    self.config.entropy_coef,
-                    self.config.entropy_end,
-                    self.config.entropy_schedule,
-                    progress,
-                )
-
-                # Update learning rate
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = lr
-
-                # Collect rollouts
-                collection_metrics = self.collect_rollouts(rollout_length)
-
-                # Learn from collected data
-                learning_metrics = self.learn(clip_epsilon, entropy_coef)
-
-                # Combine metrics
-                update_time = time.time() - update_start_time
-                all_metrics = {
-                    **collection_metrics,
-                    **learning_metrics,
-                    "learning_rate": lr,
-                    "clip_epsilon": clip_epsilon,
-                    "entropy_coef": entropy_coef,
-                    "update_time": update_time,
-                    "total_time": time.time() - start_time,
-                }
-
-                # Logging
-                if update % self.config.log_interval == 0:
-                    logger.info(
-                        f"Update {update}/{num_updates} | "
-                        f"Steps: {self.global_step} | "
-                        f"Reward: {all_metrics['mean_episode_reward']:.2f} | "
-                        f"Policy Loss: {all_metrics['policy_loss']:.4f} | "
-                        f"Value Loss: {all_metrics['value_loss']:.4f} | "
-                        f"Entropy: {all_metrics['entropy']:.4f} | "
-                        f"KL: {all_metrics['kl_divergence']:.4f} | "
-                        f"Clip: {all_metrics['clip_fraction']:.3f} | "
-                        f"SPS: {all_metrics['steps_per_second']:.0f}"
-                    )
-                    self._log_metrics(all_metrics)
-
-                # Evaluation
-                if (
-                    self.eval_env is not None
-                    and update % self.config.eval_interval == 0
-                ):
-                    eval_metrics = self.evaluate(num_episodes=10)
-                    logger.info(
-                        f"Evaluation: {eval_metrics['eval_reward']:.2f} ± "
-                        f"{eval_metrics['eval_reward_std']:.2f}"
-                    )
-                    self._log_metrics(eval_metrics, prefix="eval")
-
-                    # Track best eval model
-                    if eval_metrics["eval_reward"] > self.best_eval_reward:
-                        self.best_eval_reward = eval_metrics["eval_reward"]
-                        self.save_checkpoint(is_best=True)
-
-                # Checkpointing
-                if all_metrics["mean_episode_reward"] > self.best_mean_reward:
-                    self.best_mean_reward = all_metrics["mean_episode_reward"]
-                    if self.eval_env is None:  # Save best if no eval env
-                        self.save_checkpoint(is_best=True)
-
-                if update % self.config.save_interval == 0:
-                    self.save_checkpoint()
-
-        except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
-        except Exception as e:
-            logger.error(f"Training failed with exception: {e}", exc_info=True)
-            raise
-        finally:
-            # Cleanup
-            if self.executor is not None:
-                self.executor.shutdown(wait=True)
-
-            # Save final model
-            self.save_checkpoint(self.checkpoint_dir / "final_model.pt")
-
-            # Close logging
-            if self.writer is not None:
-                self.writer.close()
-
-            total_time = time.time() - start_time
-            logger.info(f"Training completed! Total time: {total_time/3600:.2f} hours")
-            logger.info(f"Best mean reward: {self.best_mean_reward:.2f}")
-            if self.eval_env is not None:
-                logger.info(f"Best eval reward: {self.best_eval_reward:.2f}")
+        if "reward_normalizer" in checkpoint and self.reward_normalizer:
+            self.reward_normalizer = checkpoint["reward_normalizer"]
+        logger.info(f"Loaded checkpoint from {path}")
