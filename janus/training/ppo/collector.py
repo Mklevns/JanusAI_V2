@@ -33,28 +33,34 @@ class AsyncRolloutCollector:
     def __init__(
         self,
         envs: List,
-        device,
+        device: torch.device,
         num_workers: int = 4,
         use_subprocess: bool = False,
         seed: int = 42,
     ):
-        """Initialize the AsyncRolloutCollector with environments and settings."""
+        """Initialize with reproducible seeding."""
         self.envs = envs
         self.device = device
         self.n_envs = len(envs)
         self.num_workers = min(num_workers, self.n_envs)
         self.use_subprocess = use_subprocess
 
+        # Set seeds for each environment differently
+        for i, env in enumerate(envs):
+            env.seed(seed + i) # individual seeding
+            # Also seed global random modules for general reproducibility outside envs
+            # Though per-env seeding is more targeted for env behavior.
         np.random.seed(seed)
         random.seed(seed)
         torch.manual_seed(seed)
 
+        # Initialize tracking with thread-safe statistics
         self.episode_rewards = [deque(maxlen=100) for _ in range(self.n_envs)]
         self.episode_lengths = [deque(maxlen=100) for _ in range(self.n_envs)]
         self.current_episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
         self.current_episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
         self.last_valid_obs = [None] * self.n_envs
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # Use RLock for re-entrant locking
 
         self.current_obs = self._reset_all_envs()
         logger.debug(
@@ -79,29 +85,97 @@ class AsyncRolloutCollector:
     def _step_env_safe(
         self, env_idx: int, action: np.ndarray, max_retries: int = 3
     ) -> Tuple[int, np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Safely step a single environment and return transition tuple with info."""
+        """Step environment with comprehensive error handling."""
+        if not isinstance(action, np.ndarray): # Basic type check
+            try:
+                action = np.array(action) # Attempt conversion if not numpy array
+            except Exception as e:
+                logger.error(f"Failed to convert action to numpy array for env {env_idx}: {e}")
+                # Attempt to use a default/dummy action or raise error immediately
+                # For now, let's try to use a zero action if possible, or re-raise
+                if hasattr(self.envs[env_idx].action_space, 'sample'):
+                    action = np.zeros_like(self.envs[env_idx].action_space.sample())
+                else: # Cannot create a sensible default
+                    raise ValueError(f"Action for env {env_idx} is not a np.ndarray and cannot be converted or defaulted.")
+
+
+        if action.shape != self.envs[env_idx].action_space.shape:
+            # Before raising, check if action_space is discrete and action is a scalar
+            is_discrete = hasattr(self.envs[env_idx].action_space, 'n')
+            is_scalar_action_for_discrete = is_discrete and action.ndim == 0
+
+            if not (is_discrete and action.ndim == 1 and action.shape[0] == 1) and \
+               not is_scalar_action_for_discrete : # Allow single int in array for discrete
+                # If action is scalar for discrete, it's often passed as (e.g.) np.array(2) not np.array([2])
+                # Some envs expect int, others np.array([int]). The check above is a bit lenient.
+                # A common pattern is discrete actions are int, continuous are float arrays.
+                # The provided check `action.shape != self.envs[env_idx].action_space.shape`
+                # might be too strict if `action_space.shape` is `()` for discrete but action is `(1,)`.
+                # For now, let's assume the original check is intended.
+                 raise ValueError(
+                    f"Action shape mismatch for env {env_idx}: "
+                    f"expected {self.envs[env_idx].action_space.shape}, got {action.shape}"
+                )
+
         for attempt in range(max_retries):
             try:
                 step_output = self.envs[env_idx].step(action)
+
+                # Handle both Gym and Gymnasium APIs
                 if len(step_output) == 4:
                     next_obs, reward, done, info = step_output
-                    truncated = False
+                    truncated = False #gym.Env
+                elif len(step_output) == 5:
+                    next_obs, reward, done, truncated, info = step_output #gymnasium.Env
                 else:
-                    next_obs, reward, done, truncated, info = step_output
+                    raise ValueError(
+                        f"Unexpected step output length for env {env_idx}: {len(step_output)}"
+                    )
+
+                # Validate outputs
+                if not isinstance(reward, (int, float, np.number)):
+                    logger.warning(f"Env {env_idx}: Reward is not numeric ({type(reward)}), attempting to cast.")
+                    try:
+                        reward = float(reward)
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Env {env_idx}: Failed to cast reward to float: {e}. Using 0.0.")
+                        reward = 0.0
+                        # raise TypeError(f"Reward must be numeric, got {type(reward)}")
+                if not isinstance(done, (bool, np.bool_)):
+                    logger.warning(f"Env {env_idx}: Done is not boolean ({type(done)}), attempting to cast.")
+                    try:
+                        done = bool(done)
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Env {env_idx}: Failed to cast done to bool: {e}. Using True (terminating).")
+                        done = True # Terminate on unknown state
+                        # raise TypeError(f"Done must be boolean, got {type(done)}")
+                if not isinstance(truncated, (bool, np.bool_)): # Added check for truncated
+                    logger.warning(f"Env {env_idx}: Truncated is not boolean ({type(truncated)}), attempting to cast.")
+                    try:
+                        truncated = bool(truncated)
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Env {env_idx}: Failed to cast truncated to bool: {e}. Using False.")
+                        truncated = False
+
+
                 self.last_valid_obs[env_idx] = next_obs.copy()
-                return env_idx, next_obs, reward, done, truncated, info
-            except Exception:
-                logger.exception(
-                    "Env %d step failed (attempt %d/%d)",
-                    env_idx,
-                    attempt + 1,
-                    max_retries,
+                return env_idx, next_obs, float(reward), bool(done), bool(truncated), info
+
+            except Exception as e:
+                logger.error(
+                    "Env %d step failed (attempt %d/%d): %s",
+                    env_idx, attempt + 1, max_retries, str(e),
+                    exc_info=True # adding exc_info for more details
                 )
                 if attempt == max_retries - 1:
                     logger.warning(
                         "Max retries reached for env %d, attempting reset", env_idx
                     )
                     return self._reset_env_on_failure(env_idx)
+
+        # This part should ideally not be reached if max_retries > 0 because
+        # the loop either returns successfully or calls _reset_env_on_failure.
+        # However, to satisfy linters/type checkers that a return is guaranteed:
         return self._reset_env_on_failure(env_idx)
 
     def _reset_env_on_failure(

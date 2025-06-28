@@ -71,11 +71,27 @@ def setup_configuration(args: argparse.Namespace) -> PPOConfig:
     return config
 
 
-def setup_environments(num_envs: int, enable_eval: bool) -> Tuple[List[BaseEnv], Optional[BaseEnv]]:
-    """Creates training and evaluation environments."""
-    logger.info(f"Creating {num_envs} parallel environments...")
-    envs = [SymbolicRegressionEnv() for _ in range(num_envs)]
-    eval_env = SymbolicRegressionEnv() if enable_eval else None
+def setup_environments(
+    num_envs: int,
+    enable_eval: bool,
+    seed: int = 42
+) -> Tuple[List[BaseEnv], Optional[BaseEnv]]:
+    """Create environments with proper seeding."""
+    logger.info(f"Creating {num_envs} parallel environments with base seed {seed}...")
+
+    # Create environments with different seeds
+    envs = []
+    for i in range(num_envs):
+        env = SymbolicRegressionEnv()
+        env.seed(seed + i)
+        envs.append(env)
+
+    eval_env = None
+    if enable_eval:
+        eval_env = SymbolicRegressionEnv()
+        eval_env.seed(seed + num_envs)  # Different seed for eval
+        logger.info(f"Evaluation environment created with seed {seed + num_envs}")
+
     return envs, eval_env
 
 
@@ -152,7 +168,8 @@ def main(cli_args: argparse.Namespace) -> int:
         config = setup_configuration(cli_args)
 
         # Step 3: Create environments
-        envs, eval_env = setup_environments(config.num_workers, cli_args.eval)
+        # Pass the seed from cli_args to setup_environments
+        envs, eval_env = setup_environments(config.num_workers, cli_args.eval, cli_args.seed)
 
         # Step 4: Create agent
         agent = setup_agent(config, cli_args, envs)
