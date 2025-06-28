@@ -1,41 +1,41 @@
 # ----------------------------------------
-# configs/demo_config.yaml - Quick testing
+# configs/cpu_optimized.yaml - CPU only
 # ----------------------------------------
-# Minimal config for testing and development
+# Optimized for CPU-only training
 learning_rate: 0.0003
 gamma: 0.99
 gae_lambda: 0.95
 clip_epsilon: 0.2
 value_coef: 0.5
 entropy_coef: 0.01
-n_epochs: 10
-batch_size: 64
+n_epochs: 5  # Fewer epochs for CPU
+batch_size: 32  # Smaller batch for CPU
 action_space_type: "discrete"
 
-# Stability
+# CPU optimization
 max_grad_norm: 0.5
-use_mixed_precision: false
+use_mixed_precision: false  # No AMP on CPU
 gradient_accumulation_steps: 1
 clip_vloss: true
 normalize_advantages: true
 normalize_rewards: false
 
-# Scheduling
+# Simple scheduling
 lr_schedule: "constant"
 clip_schedule: "constant"
 entropy_schedule: "constant"
 
 # Hardware
-device: "auto"
-num_workers: 4
-use_subprocess_envs: false
+device: "cpu"
+num_workers: 8  # Match CPU cores
+use_subprocess_envs: true
 
 # Error handling
-fail_on_env_error: true
+fail_on_env_error: false
 max_env_retries: 3
 
 # Logging
-log_interval: 10
-save_interval: 100
-eval_interval: 500
-experiment_name: "ppo_demo"
+log_interval: 50
+save_interval: 500
+eval_interval: 1000
+experiment_name: "ppo_cpu"

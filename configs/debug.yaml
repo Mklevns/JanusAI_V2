@@ -1,0 +1,53 @@
+# ----------------------------------------
+# configs/debug.yaml - Debugging config
+# ----------------------------------------
+# Configuration for debugging issues
+learning_rate: 0.001  # Higher for faster convergence
+gamma: 0.95  # Lower for debugging
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+n_epochs: 1  # Single epoch for debugging
+batch_size: 16  # Small batch for debugging
+action_space_type: "discrete"
+
+# Debug settings
+max_grad_norm: 10.0  # Higher to avoid clipping during debug
+use_mixed_precision: false
+gradient_accumulation_steps: 1
+clip_vloss: false  # Disable for debugging
+normalize_advantages: false
+normalize_rewards: false
+
+# No scheduling during debug
+lr_schedule: "constant"
+clip_schedule: "constant"
+entropy_schedule: "constant"
+target_kl: null  # No early stopping
+
+# Hardware
+device: "cpu"  # CPU for determinism
+num_workers: 1  # Single worker for debugging
+use_subprocess_envs: false
+
+# Error handling
+fail_on_env_error: true  # Fail fast
+max_env_retries: 0
+
+# Verbose logging
+log_interval: 1
+save_interval: 10
+eval_interval: 10
+experiment_name: "ppo_debug"
+
+# Debug features
+enable_profiling: true
+profiler_trace_path: "traces/debug/"
+enable_anomaly_detection: true  # Catch NaN/Inf
+checkpoint_metric: "policy_loss"  # Track loss instead of reward
+
+# Extra debug flags
+debug_rewards: true  # Log reward components
+log_gradients: true  # Log gradient norms
+log_actions: true    # Log action distributions
