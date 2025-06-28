@@ -1,0 +1,53 @@
+# demo_config.yaml
+# PPO Training Configuration for JanusAI V2
+
+# Core PPO hyperparameters
+learning_rate: ${LEARNING_RATE:3e-4}
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+n_epochs: 10
+batch_size: 64
+
+# Optimization settings
+max_grad_norm: 0.5
+use_mixed_precision: false  # Set to true if using GPU
+gradient_accumulation_steps: 1
+
+# Learning rate scheduling
+lr_schedule: cosine  # Options: constant, linear, cosine
+clip_schedule: linear
+entropy_schedule: linear
+lr_end: 1e-5
+clip_end: 0.1
+entropy_end: 0.001
+
+# Early stopping
+target_kl: 0.015
+
+# Normalization
+normalize_advantages: true
+normalize_rewards: true
+
+# Hardware and execution
+device: auto  # auto, cpu, cuda
+num_workers: 4
+use_subprocess_envs: false  # Set to true for CPU-intensive environments
+
+# Error handling
+fail_on_env_error: false
+max_env_retries: 3
+
+# Logging intervals
+log_interval: 10
+save_interval: 100
+eval_interval: 50
+
+# Experiment metadata
+experiment_tags:
+  project: janus_v2
+  algorithm: ppo
+  environment: symbolic_regression
+  version: 1.0

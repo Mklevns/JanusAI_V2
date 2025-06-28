@@ -1,0 +1,15 @@
+# configs/ppo_agent/experimental_config.yaml
+# Experimental configuration with modern techniques
+layer_sizes: [256, 256]
+activation: swish  # Smooth activation
+use_layer_norm: true
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.05
+initialization: orthogonal
+gain: 1.414
+# For future extensions
+use_recurrent: false
+recurrent_type: gru
+recurrent_hidden_size: 256
+recurrent_layers: 2

@@ -1,0 +1,10 @@
+# configs/ppo_agent/actor_config_small.yaml
+# Small actor network for simple environments
+layer_sizes: [64, 64]
+activation: tanh
+use_layer_norm: false
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.0
+initialization: orthogonal
+gain: 1.414  # sqrt(2) for tanh

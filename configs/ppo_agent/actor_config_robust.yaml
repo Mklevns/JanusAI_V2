@@ -1,0 +1,10 @@
+# configs/ppo_agent/actor_config_robust.yaml
+# Robust actor with regularization
+layer_sizes: [256, 256, 128]
+activation: elu
+use_layer_norm: true
+use_batch_norm: false
+use_spectral_norm: true  # For stability
+dropout_rate: 0.1  # Regularization
+initialization: xavier
+gain: 1.0

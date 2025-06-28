@@ -1,0 +1,17 @@
+# critic_network_config.yaml
+# Critic network configuration
+
+layer_sizes: [256, 256]
+activation: relu
+use_layer_norm: false
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.0
+initialization: orthogonal
+gain: 1.0
+
+# Recurrent options (optional)
+use_recurrent: false
+recurrent_type: lstm
+recurrent_hidden_size: 128
+recurrent_layers: 1

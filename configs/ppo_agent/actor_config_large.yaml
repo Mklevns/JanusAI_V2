@@ -1,0 +1,10 @@
+# configs/ppo_agent/actor_config_large.yaml
+# Large actor network for complex environments
+layer_sizes: [256, 256]
+activation: gelu
+use_layer_norm: true
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.0
+initialization: orthogonal
+gain: 1.414

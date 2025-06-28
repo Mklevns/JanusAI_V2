@@ -1,0 +1,15 @@
+# configs/ppo_agent/actor_config_recurrent.yaml
+# Recurrent actor for partial observability
+layer_sizes: [64]
+activation: relu
+use_layer_norm: false
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.0
+initialization: orthogonal
+gain: 1.414
+# Recurrent settings
+use_recurrent: true
+recurrent_type: lstm
+recurrent_hidden_size: 128
+recurrent_layers: 1

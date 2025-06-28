@@ -1,0 +1,10 @@
+# configs/ppo_agent/actor_config_continuous.yaml
+# Actor for continuous control tasks
+layer_sizes: [256, 256]
+activation: tanh
+use_layer_norm: true
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.0
+initialization: orthogonal
+gain: 0.01  # Small gain for final layer

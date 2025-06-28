@@ -1,0 +1,10 @@
+# configs/ppo_agent/critic_config_small.yaml
+# Small critic network for simple environments
+layer_sizes: [64, 64]
+activation: tanh
+use_layer_norm: false
+use_batch_norm: false
+use_spectral_norm: false
+dropout_rate: 0.0
+initialization: orthogonal
+gain: 1.0
