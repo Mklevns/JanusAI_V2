@@ -73,14 +73,14 @@ class PPOAgent(BaseAgent, nn.Module):
         """
         # Suggestion 3: Robust cooperative multiple inheritance
         super().__init__()
-        
+
         self.device = torch.device(device)
         self.action_dim = action_dim
 
         # Build actor and critic networks from configs
         self.actor = build_network(observation_dim, action_dim, actor_config)
         self.critic = build_network(observation_dim, 1, critic_config)
-        
+
         # Suggestion 5: Explicitly move networks to the specified device
         self.to(self.device)
         logger.info(f"PPOAgent initialized on device '{self.device}'")
@@ -103,10 +103,10 @@ class PPOAgent(BaseAgent, nn.Module):
         """
         if observation.dim() == 1:
             observation = observation.unsqueeze(0)
-        
+
         # Suggestion 5: Ensure tensors are on the correct device
         obs_tensor = observation.to(self.device)
-        
+
         action_logits = self.actor(obs_tensor)
 
         # Suggestion 7: Support for Action Masking
@@ -118,7 +118,7 @@ class PPOAgent(BaseAgent, nn.Module):
         dist = Categorical(action_probs)
         action = dist.sample()
         action_logprob = dist.log_prob(action)
-        
+
         return action.detach(), action_logprob.detach()
 
     def evaluate(
@@ -129,7 +129,7 @@ class PPOAgent(BaseAgent, nn.Module):
         """Evaluates a state-action pair during training."""
         obs_tensor = observation.to(self.device)
         action_tensor = action.to(self.device)
-        
+
         action_probs = self.actor(obs_tensor)
         dist = Categorical(action_probs)
         action_logprob = dist.log_prob(action_tensor)
@@ -154,7 +154,7 @@ class PPOAgent(BaseAgent, nn.Module):
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
         logger.info(f"Agent checkpoint loaded from '{path}'")
         self.to(self.device) # Ensure model is on the correct device after loading
-        
+
     def learn(self, *args, **kwargs) -> None:
         # Suggestion 4: Raise error to enforce trainer-based learning
         raise NotImplementedError("PPOAgent learning must be handled by a dedicated PPOTrainer.")
@@ -178,13 +178,13 @@ if __name__ == '__main__':
     )
     print("\nActor Architecture:\n", agent.actor)
     print("\nCritic Architecture:\n", agent.critic)
-    
+
     # 3. Demonstrate action masking
     logger.info("\n--- Demonstrating Action Masking ---")
     dummy_obs = torch.randn(1, 10)
     # Mask to only allow actions 1 and 3
     action_mask = torch.tensor([False, True, False, True])
-    
+
     for _ in range(10):
         action, _ = agent.act(dummy_obs, action_mask=action_mask)
         assert action.item() in [1, 3], f"Action masking failed! Got action {action.item()}"
@@ -194,11 +194,11 @@ if __name__ == '__main__':
     logger.info("\n--- Demonstrating Checkpointing ---")
     import tempfile
     import os
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpoint_path = os.path.join(tmpdir, "ppo_agent.pt")
         agent.save_checkpoint(checkpoint_path)
-        
+
         # Create a new agent and load the checkpoint
         new_agent = PPOAgent(10, 4, actor_conf, critic_conf)
         new_agent.load_checkpoint(checkpoint_path)
