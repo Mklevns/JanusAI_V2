@@ -34,3 +34,10 @@ repos:
       - id: mypy
         additional_dependencies: [types-all]
         args: ['--ignore-missing-imports']
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+    -   id: mypy
+        args: [--ignore-missing-imports, --strict-optional, --check-untyped-defs]
+        # Mypy can be slow, so you might want to run it only on changed files
+        files: ^janus/

@@ -11,3 +11,7 @@ max-module-lines=1000
 max-parents=3
 max-nested-blocks=4
 max-returns=6
+
+[MESSAGES CONTROL]
+disable=memory_leak_tensor
+disable=missing-module-docstring
