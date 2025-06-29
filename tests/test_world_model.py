@@ -1,359 +1,470 @@
 # tests/test_world_model.py
 """
-Unit tests for the World Model components (VAE, MDN-RNN, and WorldModelAgent).
+Integration tests for World Model PPO implementation.
+
+Tests the VAE, MDN-RNN, and WorldModelPPOTrainer components
+to ensure they work correctly together.
 """
 
 import pytest
 import torch
 import numpy as np
-from pathlib import Path
 import tempfile
+from pathlib import Path
+import gym
 
-from janus.agents.components.vae import VariationalAutoencoder, VAEConfig, preprocess_observation
-from janus.agents.components.mdn_rnn import MDN_RNN, MDNRNNConfig
-from janus.agents.world_model_agent import WorldModelAgent
+from janus.agents.components.vae import VariationalAutoencoder
+from janus.agents.components.mdn_rnn import MDNRNN
+from janus.training.ppo.world_model_trainer import WorldModelPPOTrainer, WorldModelConfig
+from janus.training.ppo.config import PPOConfig
+from janus.agents.ppo_agent import PPOAgent, NetworkConfig
 
 
 class TestVAE:
-    """Test the Variational Autoencoder component."""
+    """Test VariationalAutoencoder component."""
 
     @pytest.fixture
-    def vae_config(self):
-        """Create a test VAE configuration."""
-        return VAEConfig(
-            input_channels=3,
-            input_height=64,
-            input_width=64,
+    def vae(self):
+        """Create test VAE instance."""
+        return VariationalAutoencoder(
+            input_dim=100,
             latent_dim=16,
-            hidden_channels=[16, 32],
+            hidden_dims=[64, 32],
             beta=1.0
         )
 
-    @pytest.fixture
-    def vae(self, vae_config):
-        """Create a test VAE instance."""
-        return VariationalAutoencoder(vae_config)
-
-    def test_vae_initialization(self, vae, vae_config):
+    def test_initialization(self, vae):
         """Test VAE initialization."""
-        assert vae.config.latent_dim == 16
-        assert vae.config.input_channels == 3
-        assert vae.config.hidden_channels == [16, 32]
+        assert vae.input_dim == 100
+        assert vae.latent_dim == 16
+        assert vae.beta == 1.0
 
-    def test_vae_forward(self, vae):
+    def test_forward_pass(self, vae):
         """Test VAE forward pass."""
-        batch_size = 4
-        x = torch.randn(batch_size, 3, 64, 64)
+        batch_size = 8
+        x = torch.randn(batch_size, 100)
 
-        reconstruction, mu, logvar = vae(x)
+        recon_x, mu, logvar, z = vae(x)
 
-        assert reconstruction.shape == x.shape
+        assert recon_x.shape == (batch_size, 100)
         assert mu.shape == (batch_size, 16)
         assert logvar.shape == (batch_size, 16)
+        assert z.shape == (batch_size, 16)
 
-    def test_vae_loss(self, vae):
+    def test_loss_calculation(self, vae):
         """Test VAE loss calculation."""
-        batch_size = 4
-        x = torch.randn(batch_size, 3, 64, 64)
+        batch_size = 8
+        x = torch.randn(batch_size, 100)
+        recon_x, mu, logvar, z = vae(x)
 
-        reconstruction, mu, logvar = vae(x)
-        loss, loss_dict = vae.loss(x, reconstruction, mu, logvar)
+        loss, loss_dict = vae.loss(x, recon_x, mu, logvar)
 
         assert isinstance(loss, torch.Tensor)
-        assert loss.dim() == 0  # Scalar
-        assert 'total_loss' in loss_dict
-        assert 'recon_loss' in loss_dict
-        assert 'kl_loss' in loss_dict
+        assert loss.shape == ()
+        assert 'reconstruction' in loss_dict
+        assert 'kl_divergence' in loss_dict
+        assert loss_dict['total'] > 0
 
-    def test_vae_encode_decode(self, vae):
+    def test_encode_decode(self, vae):
         """Test encoding and decoding separately."""
-        batch_size = 2
-        x = torch.randn(batch_size, 3, 64, 64)
+        x = torch.randn(4, 100)
 
         # Encode
         mu, logvar = vae.encode(x)
-        assert mu.shape == (batch_size, 16)
+        assert mu.shape == (4, 16)
+        assert logvar.shape == (4, 16)
 
-        # Reparameterize
+        # Sample
         z = vae.reparameterize(mu, logvar)
-        assert z.shape == (batch_size, 16)
+        assert z.shape == (4, 16)
 
         # Decode
-        reconstruction = vae.decode(z)
-        assert reconstruction.shape == x.shape
+        recon = vae.decode(z)
+        assert recon.shape == (4, 100)
 
-    def test_get_latent(self, vae):
-        """Test getting latent representations."""
-        x = torch.randn(1, 3, 64, 64)
+    def test_deterministic_mode(self, vae):
+        """Test VAE in eval mode (deterministic)."""
+        vae.eval()
+        x = torch.randn(1, 100)
 
-        # Stochastic
-        z1 = vae.get_latent(x, deterministic=False)
-        z2 = vae.get_latent(x, deterministic=False)
-        assert not torch.allclose(z1, z2)  # Should be different due to sampling
+        # Multiple forward passes should give same z
+        _, mu1, _, z1 = vae(x)
+        _, mu2, _, z2 = vae(x)
 
-        # Deterministic
-        z3 = vae.get_latent(x, deterministic=True)
-        z4 = vae.get_latent(x, deterministic=True)
-        assert torch.allclose(z3, z4)  # Should be the same
-
-    def test_preprocess_observation(self):
-        """Test observation preprocessing utility."""
-        # Test grayscale image
-        obs_gray = np.random.rand(64, 64)
-        processed = preprocess_observation(obs_gray)
-        assert processed.shape == (1, 1, 64, 64)
-
-        # Test RGB image (channel last)
-        obs_rgb = np.random.rand(64, 64, 3)
-        processed = preprocess_observation(obs_rgb)
-        assert processed.shape == (1, 3, 64, 64)
-
-        # Test resizing
-        obs_large = np.random.rand(128, 128, 3)
-        processed = preprocess_observation(obs_large, target_size=(64, 64))
-        assert processed.shape == (1, 3, 64, 64)
+        assert torch.allclose(z1, mu1)  # In eval, z = mu
+        assert torch.allclose(z1, z2)
 
 
 class TestMDNRNN:
-    """Test the MDN-RNN component."""
+    """Test MDN-RNN component."""
 
     @pytest.fixture
-    def mdn_config(self):
-        """Create a test MDN-RNN configuration."""
-        return MDNRNNConfig(
+    def mdn_rnn(self):
+        """Create test MDN-RNN instance."""
+        return MDNRNN(
             latent_dim=16,
             action_dim=4,
             hidden_dim=64,
-            num_mixtures=3,
-            rnn_layers=1,
-            rnn_type="lstm"
+            num_mixtures=3
         )
 
-    @pytest.fixture
-    def mdn_rnn(self, mdn_config):
-        """Create a test MDN-RNN instance."""
-        return MDN_RNN(mdn_config)
-
-    def test_mdn_initialization(self, mdn_rnn, mdn_config):
+    def test_initialization(self, mdn_rnn):
         """Test MDN-RNN initialization."""
-        assert mdn_rnn.config.latent_dim == 16
-        assert mdn_rnn.config.action_dim == 4
-        assert mdn_rnn.config.num_mixtures == 3
+        assert mdn_rnn.latent_dim == 16
+        assert mdn_rnn.action_dim == 4
+        assert mdn_rnn.hidden_dim == 64
+        assert mdn_rnn.num_mixtures == 3
 
-    def test_mdn_forward(self, mdn_rnn):
-        """Test MDN-RNN forward pass."""
+    def test_forward_single_step(self, mdn_rnn):
+        """Test single step prediction."""
+        batch_size = 4
+        latent = torch.randn(batch_size, 16)
+        action = torch.randn(batch_size, 4)
+        hidden = mdn_rnn.init_hidden(batch_size)
+
+        pi, mu, log_sigma, new_hidden = mdn_rnn(latent, action, hidden)
+
+        assert pi.shape == (batch_size, 3)  # num_mixtures
+        assert mu.shape == (batch_size, 3, 16)  # num_mixtures, latent_dim
+        assert log_sigma.shape == (batch_size, 3, 16)
+        assert new_hidden[0].shape == (1, batch_size, 64)  # LSTM hidden
+
+    def test_forward_sequence(self, mdn_rnn):
+        """Test sequence prediction."""
         batch_size = 2
         seq_len = 5
+        latent_seq = torch.randn(batch_size, seq_len, 16)
+        action_seq = torch.randn(batch_size, seq_len, 4)
 
-        z = torch.randn(batch_size, seq_len, 16)
-        a = torch.randn(batch_size, seq_len, 4)
-        hidden = mdn_rnn.init_hidden(batch_size, torch.device('cpu'))
+        pi, mu, log_sigma, hidden = mdn_rnn(latent_seq, action_seq)
 
-        pi, mu, sigma, new_hidden = mdn_rnn(z, a, hidden)
+        assert pi.shape == (batch_size, seq_len, 3)
+        assert mu.shape == (batch_size, seq_len, 3, 16)
+        assert log_sigma.shape == (batch_size, seq_len, 3, 16)
 
-        assert pi.shape == (batch_size, seq_len, 3)  # num_mixtures
-        assert mu.shape == (batch_size, seq_len, 3, 16)  # num_mixtures x latent_dim
-        assert sigma.shape == (batch_size, seq_len, 3, 16)
-        assert isinstance(new_hidden, tuple)  # LSTM returns (h, c)
-
-    def test_mdn_sample(self, mdn_rnn):
-        """Test sampling from MDN output."""
-        batch_size = 4
-
+    def test_sampling(self, mdn_rnn):
+        """Test sampling from mixture distribution."""
+        batch_size = 8
         pi = torch.softmax(torch.randn(batch_size, 3), dim=-1)
         mu = torch.randn(batch_size, 3, 16)
-        sigma = torch.abs(torch.randn(batch_size, 3, 16)) + 0.1
+        log_sigma = torch.randn(batch_size, 3, 16) * 0.1
 
-        z_next = mdn_rnn.sample(pi, mu, sigma)
+        z_next = mdn_rnn.sample(pi, mu, log_sigma)
         assert z_next.shape == (batch_size, 16)
 
-    def test_mdn_loss(self, mdn_rnn):
+    def test_loss_calculation(self, mdn_rnn):
         """Test MDN loss calculation."""
         batch_size = 4
-
         z_true = torch.randn(batch_size, 16)
         pi = torch.softmax(torch.randn(batch_size, 3), dim=-1)
         mu = torch.randn(batch_size, 3, 16)
-        sigma = torch.abs(torch.randn(batch_size, 3, 16)) + 0.1
+        log_sigma = torch.randn(batch_size, 3, 16) * 0.1
 
-        loss, loss_dict = mdn_rnn.loss(z_true, pi, mu, sigma)
+        loss, loss_dict = mdn_rnn.loss(z_true, pi, mu, log_sigma)
 
         assert isinstance(loss, torch.Tensor)
-        assert loss.dim() == 0  # Scalar
-        assert 'mdn_loss' in loss_dict
-        assert 'mean_nll' in loss_dict
-
-    def test_init_hidden(self, mdn_rnn):
-        """Test hidden state initialization."""
-        batch_size = 8
-        device = torch.device('cpu')
-
-        # LSTM
-        hidden = mdn_rnn.init_hidden(batch_size, device)
-        assert isinstance(hidden, tuple)
-        assert hidden[0].shape == (1, batch_size, 64)
-        assert hidden[1].shape == (1, batch_size, 64)
-
-        # Test GRU
-        mdn_rnn.config.rnn_type = "gru"
-        mdn_rnn.rnn = torch.nn.GRU(64, 64, 1, batch_first=True)
-        hidden = mdn_rnn.init_hidden(batch_size, device)
-        assert isinstance(hidden, torch.Tensor)
-        assert hidden.shape == (1, batch_size, 64)
+        assert loss.shape == ()
+        assert 'nll' in loss_dict
+        assert loss_dict['nll'] > 0
 
 
-class TestWorldModelAgent:
-    """Test the integrated WorldModelAgent."""
+class TestWorldModelPPOTrainer:
+    """Test WorldModelPPOTrainer integration."""
 
     @pytest.fixture
-    def world_model_agent(self):
-        """Create a test WorldModelAgent."""
-        return WorldModelAgent(
-            observation_shape=(3, 64, 64),
-            action_dim=4,
-            vae_config=VAEConfig(
-                input_channels=3,
-                input_height=64,
-                input_width=64,
-                latent_dim=8
-            ),
-            mdn_config=MDNRNNConfig(
-                latent_dim=8,
-                action_dim=4,
-                hidden_dim=32,
-                num_mixtures=2
-            ),
-            device='cpu'
+    def setup(self):
+        """Setup test environment and configurations."""
+        # Create simple environment
+        envs = [gym.make('CartPole-v1') for _ in range(2)]
+
+        # Configurations
+        ppo_config = PPOConfig(
+            learning_rate=3e-4,
+            n_epochs=2,
+            batch_size=32,
+            num_workers=2,
+            log_interval=100
         )
 
-    def test_agent_initialization(self, world_model_agent):
-        """Test agent initialization."""
-        assert world_model_agent.observation_shape == (3, 64, 64)
-        assert world_model_agent.action_dim == 4
-        assert world_model_agent.vae_config.latent_dim == 8
-        assert world_model_agent.mdn_config.hidden_dim == 32
-
-    def test_agent_reset(self, world_model_agent):
-        """Test agent reset."""
-        world_model_agent.reset(batch_size=2)
-
-        assert world_model_agent.current_hidden is not None
-        assert world_model_agent.current_latent is None
-
-    def test_encode_observation(self, world_model_agent):
-        """Test observation encoding."""
-        obs = torch.randn(1, 3, 64, 64)
-
-        z = world_model_agent.encode_observation(obs)
-        assert z.shape == (1, 8)
-
-    def test_agent_act(self, world_model_agent):
-        """Test agent action selection."""
-        world_model_agent.reset(batch_size=1)
-
-        obs = torch.randn(1, 3, 64, 64)
-        action, log_prob, components = world_model_agent.act(
-            obs,
-            deterministic=False,
-            return_components=True
+        wm_config = WorldModelConfig(
+            vae_latent_dim=8,
+            vae_hidden_dims=[32],
+            mdn_hidden_dim=32,
+            mdn_num_mixtures=2,
+            pretrain_epochs=1,
+            pretrain_batch_size=16,
+            random_collection_steps=100,
+            imagination_ratio=0.3,
+            imagination_horizon=5
         )
 
-        assert isinstance(action, torch.Tensor)
-        assert isinstance(log_prob, torch.Tensor)
-        assert components is not None
-        assert 'latent' in components
-        assert 'hidden' in components
-        assert 'controller_input' in components
-
-    def test_imagine_trajectory(self, world_model_agent):
-        """Test trajectory imagination."""
-        obs = torch.randn(2, 3, 64, 64)
-        horizon = 10
-
-        trajectory = world_model_agent.imagine_trajectory(
-            obs,
-            horizon=horizon,
-            temperature=1.0
+        # Create agent
+        agent = PPOAgent(
+            observation_dim=4,
+            action_dim=2,
+            actor_config=NetworkConfig(layer_sizes=[32]),
+            critic_config=NetworkConfig(layer_sizes=[32])
         )
 
-        assert 'latents' in trajectory
-        assert 'actions' in trajectory
-        assert trajectory['latents'].shape == (2, horizon + 1, 8)
-        assert trajectory['actions'].shape == (2, horizon)
+        return envs, ppo_config, wm_config, agent
 
-    def test_save_load_components(self, world_model_agent):
-        """Test saving and loading model components."""
+    def test_trainer_initialization(self, setup):
+        """Test trainer initialization."""
+        envs, ppo_config, wm_config, agent = setup
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            save_path = Path(tmpdir)
-
-            # Save components
-            world_model_agent.save_components(save_path)
-
-            # Check files exist
-            assert (save_path / 'vae.pt').exists()
-            assert (save_path / 'mdn_rnn.pt').exists()
-            assert (save_path / 'controller.pt').exists()
-            assert (save_path / 'world_model_config.pt').exists()
-
-            # Create new agent and load
-            new_agent = WorldModelAgent(
-                observation_shape=(3, 64, 64),
-                action_dim=4,
-                device='cpu'
+            trainer = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=Path(tmpdir),
+                use_tensorboard=False,
+                use_wandb=False
             )
-            new_agent.load_components(save_path)
 
-            # Test that loaded agent works
-            obs = torch.randn(1, 3, 64, 64)
-            new_agent.reset()
-            action, log_prob, _ = new_agent.act(obs)
-            assert isinstance(action, torch.Tensor)
+            assert trainer.vae is not None
+            assert trainer.mdn_rnn is not None
+            assert trainer.vae.latent_dim == 8
+            assert trainer.mdn_rnn.latent_dim == 8
+
+    def test_random_experience_collection(self, setup):
+        """Test collecting random experience."""
+        envs, ppo_config, wm_config, agent = setup
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=Path(tmpdir),
+                use_tensorboard=False,
+                use_wandb=False
+            )
+
+            # Collect experience
+            trainer.collect_random_experience(50)
+
+            assert len(trainer.experience_buffer['observations']) >= 50
+            assert len(trainer.experience_buffer['actions']) >= 50
+            assert len(trainer.experience_buffer['next_observations']) >= 50
+
+    def test_world_model_pretraining(self, setup):
+        """Test pretraining VAE and MDN-RNN."""
+        envs, ppo_config, wm_config, agent = setup
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=Path(tmpdir),
+                use_tensorboard=False,
+                use_wandb=False
+            )
+
+            # Collect and pretrain
+            trainer.collect_random_experience(100)
+            trainer.pretrain_world_model()
+
+            # Test that models can encode observations
+            obs = torch.randn(1, 4)
+            with torch.no_grad():
+                z, _ = trainer.vae.encode(obs.view(1, -1))
+                assert z.shape == (1, 8)
+
+    def test_imagination_rollout(self, setup):
+        """Test generating imagined trajectories."""
+        envs, ppo_config, wm_config, agent = setup
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=Path(tmpdir),
+                use_tensorboard=False,
+                use_wandb=False
+            )
+
+            # Need some experience first
+            trainer.collect_random_experience(100)
+            trainer.pretrain_world_model()
+
+            # Test imagination
+            start_obs = torch.randn(2, 4)
+            imagined = trainer.imagine_rollout(start_obs, horizon=5)
+
+            assert 'latents' in imagined
+            assert 'actions' in imagined
+            assert 'values' in imagined
+            assert imagined['latents'].shape == (2, 5, 8)
+            assert imagined['actions'].shape == (2, 5)
+            assert imagined['values'].shape == (2, 5)
+
+    def test_mixed_rollout_collection(self, setup):
+        """Test collecting both real and imagined rollouts."""
+        envs, ppo_config, wm_config, agent = setup
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=Path(tmpdir),
+                use_tensorboard=False,
+                use_wandb=False
+            )
+
+            # Initialize buffer
+            from janus.training.ppo.buffer import RolloutBuffer
+            trainer.buffer = RolloutBuffer(
+                buffer_size=100,
+                obs_shape=(wm_config.vae_latent_dim + wm_config.mdn_hidden_dim,),
+                action_shape=(),
+                device=trainer.device,
+                n_envs=trainer.n_envs
+            )
+
+            # Collect experience and pretrain
+            trainer.collect_random_experience(200)
+            trainer.pretrain_world_model()
+
+            # Collect mixed rollouts
+            metrics = trainer.collect_rollouts(50)
+
+            assert 'mean_episode_reward' in metrics
+            assert trainer.buffer.ptr > 0
+
+    def test_checkpoint_save_load(self, setup):
+        """Test saving and loading world model checkpoints."""
+        envs, ppo_config, wm_config, agent = setup
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # Create and train first trainer
+            trainer1 = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=tmpdir,
+                use_tensorboard=False,
+                use_wandb=False
+            )
+
+            trainer1.collect_random_experience(100)
+            trainer1.pretrain_world_model()
+
+            # Save checkpoint
+            checkpoint_path = trainer1.save_checkpoint()
+
+            # Create new trainer and load
+            trainer2 = WorldModelPPOTrainer(
+                agent=PPOAgent(
+                    observation_dim=4,
+                    action_dim=2,
+                    actor_config=NetworkConfig(layer_sizes=[32]),
+                    critic_config=NetworkConfig(layer_sizes=[32])
+                ),
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=tmpdir,
+                use_tensorboard=False,
+                use_wandb=False
+            )
+
+            trainer2.load_checkpoint(checkpoint_path)
+
+            # Test that loaded models produce same outputs
+            test_obs = torch.randn(1, 4)
+            with torch.no_grad():
+                z1, _ = trainer1.vae.encode(test_obs.view(1, -1))
+                z2, _ = trainer2.vae.encode(test_obs.view(1, -1))
+                assert torch.allclose(z1, z2, atol=1e-6)
 
 
 class TestIntegration:
-    """Integration tests for the world model system."""
+    """Full integration tests."""
 
-    def test_end_to_end_forward_pass(self):
-        """Test complete forward pass through all components."""
-        # Create agent
-        agent = WorldModelAgent(
-            observation_shape=(1, 64, 64),
-            action_dim=2,
-            vae_config=VAEConfig(
-                input_channels=1,
-                input_height=64,
-                input_width=64,
-                latent_dim=4,
-                hidden_channels=[8, 16]
-            ),
-            mdn_config=MDNRNNConfig(
-                latent_dim=4,
-                action_dim=2,
-                hidden_dim=16,
-                num_mixtures=2
-            ),
-            device='cpu'
+    def test_short_training_run(self):
+        """Test a complete but short training run."""
+        # Setup
+        envs = [gym.make('CartPole-v1') for _ in range(2)]
+
+        ppo_config = PPOConfig(
+            learning_rate=3e-4,
+            n_epochs=1,
+            batch_size=16,
+            log_interval=10
         )
 
-        # Reset agent
-        agent.reset(batch_size=1)
+        wm_config = WorldModelConfig(
+            vae_latent_dim=4,
+            vae_hidden_dims=[16],
+            mdn_hidden_dim=16,
+            pretrain_epochs=1,
+            random_collection_steps=50,
+            imagination_ratio=0.2
+        )
 
-        # Run multiple steps
-        obs = torch.randn(1, 1, 64, 64)
-        for _ in range(5):
-            action, log_prob, components = agent.act(
-                obs,
-                return_components=True
+        agent = PPOAgent(
+            observation_dim=4,
+            action_dim=2,
+            actor_config=NetworkConfig(layer_sizes=[16]),
+            critic_config=NetworkConfig(layer_sizes=[16])
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = WorldModelPPOTrainer(
+                agent=agent,
+                envs=envs,
+                config=ppo_config,
+                world_model_config=wm_config,
+                checkpoint_dir=Path(tmpdir),
+                use_tensorboard=False,
+                use_wandb=False
             )
 
-            # Verify outputs
-            assert action.shape == torch.Size([]) or action.shape == (1,)
-            assert log_prob.shape == torch.Size([]) or log_prob.shape == (1,)
-            assert components['latent'].shape == (1, 4)
+            # Run short training
+            trainer.train(total_timesteps=500, rollout_length=100)
 
-            # Generate new observation (simplified)
-            obs = torch.randn(1, 1, 64, 64)
+            # Check that training progressed
+            assert trainer.global_step >= 500
+            assert trainer.num_updates > 0
+
+            # Check that world model was used
+            assert len(trainer.experience_buffer['observations']) > 0
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+if __name__ == '__main__':
+    # Run a quick integration test
+    print("Running World Model integration tests...")
+
+    # Test VAE
+    print("\n1. Testing VAE...")
+    vae = VariationalAutoencoder(input_dim=10, latent_dim=4)
+    x = torch.randn(2, 10)
+    recon, mu, logvar, z = vae(x)
+    print(f"✓ VAE forward pass: {x.shape} -> {z.shape}")
+
+    # Test MDN-RNN
+    print("\n2. Testing MDN-RNN...")
+    mdn = MDNRNN(latent_dim=4, action_dim=2)
+    action = torch.randn(2, 2)
+    pi, mu, log_sigma, hidden = mdn(z, action)
+    print(f"✓ MDN-RNN forward pass: z={z.shape}, a={action.shape} -> pi={pi.shape}")
+
+    # Test trainer
+    print("\n3. Testing WorldModelPPOTrainer...")
+    test = TestIntegration()
+    test.test_short_training_run()
+    print("✓ Short training run completed")
+
+    print("\nAll integration tests passed! ✓")

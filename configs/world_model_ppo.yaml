@@ -1,0 +1,84 @@
+# configs/world_model_ppo.yaml
+# Configuration for PPO with World Model (VAE + MDN-RNN)
+
+# Standard PPO hyperparameters
+learning_rate: 0.0003
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+n_epochs: 10
+batch_size: 128  # Larger for latent space training
+action_space_type: "discrete"
+
+# Stability and optimization
+max_grad_norm: 0.5
+use_mixed_precision: false  # Can enable if GPU supports
+gradient_accumulation_steps: 1
+clip_vloss: true
+normalize_advantages: true
+normalize_rewards: true
+
+# Scheduling
+lr_schedule: "cosine"
+lr_end: 0.00001
+clip_schedule: "linear"
+clip_end: 0.1
+entropy_schedule: "linear"
+entropy_end: 0.001
+target_kl: 0.02
+
+# Hardware
+device: "auto"
+num_workers: 4
+use_subprocess_envs: false
+
+# Error handling
+fail_on_env_error: false
+max_env_retries: 3
+
+# Logging
+log_interval: 10
+save_interval: 100
+eval_interval: 500
+experiment_name: "world_model_ppo_${TIMESTAMP}"
+experiment_tags:
+  model_type: "world_model"
+  vae_enabled: true
+  mdn_rnn_enabled: true
+
+# World Model specific configuration
+world_model:
+  # VAE configuration
+  vae:
+    latent_dim: 32
+    hidden_dims: [256, 128]
+    beta: 1.0  # Beta-VAE weight
+    learning_rate: 0.001
+
+  # MDN-RNN configuration
+  mdn_rnn:
+    hidden_dim: 256
+    num_mixtures: 5
+    temperature: 1.0
+    learning_rate: 0.001
+
+  # Training configuration
+  training:
+    pretrain_epochs: 10
+    pretrain_batch_size: 64
+    imagination_ratio: 0.5  # 50% real, 50% imagined experience
+    imagination_horizon: 15  # Steps to imagine ahead
+
+  # Data collection
+  data_collection:
+    random_collection_steps: 10000  # Initial random exploration
+    experience_buffer_size: 100000  # Max experiences to store
+
+  # Model-based planning (future extension)
+  planning:
+    enabled: false
+    planning_horizon: 10
+    num_candidates: 100
+    cem_iterations: 3  # Cross-entropy method iterations

@@ -1,6 +1,15 @@
+# janus/agents/components/vae.py
+"""
+Variational Autoencoder (VAE) components for the World Model.
+
+This module implements the Vision (V) component that learns to encode
+high-dimensional observations into compact latent representations. It provides
+a base VAE class and specialized implementations for vector and image data.
+"""
+
 import random
-from dataclasses import dataclass, asdict
-from typing import Tuple, Optional, List
+from dataclasses import dataclass, asdict, field
+from typing import Tuple, Optional, List, Dict, Union
 
 import numpy as np
 import torch
@@ -11,9 +20,6 @@ import torch.nn.functional as F
 def set_global_seed(seed: int):
     """
     Set global random seeds for reproducibility.
-
-    Args:
-        seed (int): Random seed value.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -25,94 +31,139 @@ def set_global_seed(seed: int):
 @dataclass
 class VAEConfig:
     """
-    Configuration dataclass for the VAE architecture.
+    Configuration dataclass for VAE architectures.
     """
-    input_channels: int = 3
-    input_height: int = 64
-    input_width: int = 64
     latent_dim: int = 32
-    hidden_channels: Optional[List[int]] = None
-    beta: float = 1.0
+    beta: float = 1.0  # Weight for KL divergence (from beta-VAE)
     seed: Optional[int] = 42
 
-    def __post_init__(self):
-        """Set default hidden channels if none are provided."""
-        if self.hidden_channels is None:
-            self.hidden_channels = [32, 64, 128, 256]
-
     def to_dict(self):
-        """Convert the config to a dictionary."""
         return asdict(self)
 
 
-class VariationalAutoencoder(nn.Module):
+@dataclass
+class VectorVAEConfig(VAEConfig):
+    """Configuration for a standard VAE processing vector data."""
+    input_dim: int = 128
+    hidden_dims: List[int] = field(default_factory=lambda: [256, 128])
+
+
+@dataclass
+class ConvVAEConfig(VAEConfig):
+    """Configuration for a Convolutional VAE processing image data."""
+    input_channels: int = 3
+    image_hw: int = 64
+    hidden_channels: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
+
+
+class BaseVAE(nn.Module):
     """
-    Convolutional Variational Autoencoder for image-based inputs.
+    Abstract base class for Variational Autoencoders.
     """
     def __init__(self, config: VAEConfig):
-        """
-        Initialize the VAE architecture based on provided config.
-
-        Args:
-            config (VAEConfig): Configuration object.
-        """
         super().__init__()
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         if config.seed is not None:
             set_global_seed(config.seed)
+        self.to(self.device)
 
-        self._calculate_conv_output_size()
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Applies the reparameterization trick."""
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        return mu  # In inference, use the deterministic mean
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full forward pass."""
+        x = x.to(self.device)
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decode(z)
+        return recon_x, mu, logvar, z
+
+    def loss(self, x: torch.Tensor, recon_x: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Computes the VAE loss (reconstruction + KL divergence)."""
+        # Note: using 'sum' and then dividing by batch size is more stable
+        recon_loss = F.mse_loss(recon_x, x, reduction="sum") / x.size(0)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+        total_loss = recon_loss + self.config.beta * kl_loss
+        return total_loss, {
+            "total_loss": total_loss.item(),
+            "recon_loss": recon_loss.item(),
+            "kl_loss": kl_loss.item(),
+        }
+
+    def get_latent(self, x: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """Gets the latent representation for a given input."""
+        with torch.no_grad():
+            x = x.to(self.device)
+            mu, logvar = self.encode(x)
+            return mu if deterministic else self.reparameterize(mu, logvar)
+
+    @staticmethod
+    def preprocess_observation(obs: np.ndarray, target_size: Tuple[int, int] = (64, 64)) -> torch.Tensor:
+        """Preprocesses an observation image for model input."""
+        if not isinstance(obs, torch.Tensor):
+             obs = torch.from_numpy(obs).float()
+
+        if obs.dim() == 3 and obs.shape[-1] in [1, 3]: # HWC to CHW
+            obs = obs.permute(2, 0, 1)
+        if obs.dim() == 2: # HW -> 1HW
+            obs = obs.unsqueeze(0)
+        if obs.dim() == 3: # CHW -> 1CHW
+            obs = obs.unsqueeze(0)
+
+        if obs.shape[-2:] != target_size:
+            obs = F.interpolate(obs, size=target_size, mode="bilinear", align_corners=False)
+
+        if obs.max() > 1.0: # Normalize to [0, 1]
+            obs = obs / 255.0
+        return obs
+
+
+class ConvVAE(BaseVAE):
+    """Convolutional VAE for image-based observations."""
+    def __init__(self, config: ConvVAEConfig):
+        super().__init__(config)
+        self.config: ConvVAEConfig # For type hinting
+
         self.encoder = self._build_encoder()
+        self._calculate_conv_output_size()
+
         self.fc_mu = nn.Linear(self.conv_output_size, config.latent_dim)
         self.fc_logvar = nn.Linear(self.conv_output_size, config.latent_dim)
         self.fc_decode = nn.Linear(config.latent_dim, self.conv_output_size)
         self.decoder = self._build_decoder()
 
-        self.to(self.device)
-
-    def _calculate_conv_output_size(self):
-        """
-        Calculate the output size after the encoder convolutions.
-        """
-        dummy_input = torch.zeros(
-            1,
-            self.config.input_channels,
-            self.config.input_height,
-            self.config.input_width,
-        )
-        temp_encoder = self._build_encoder()
-        with torch.no_grad():
-            output = temp_encoder(dummy_input)
-            self.conv_output_size = output.view(1, -1).size(1)
-            self.conv_output_shape = output.shape[1:]
-
     def _build_encoder(self) -> nn.Sequential:
-        """
-        Construct the encoder CNN layers.
-
-        Returns:
-            nn.Sequential: Encoder network.
-        """
         layers = []
         in_channels = self.config.input_channels
         for out_channels in self.config.hidden_channels:
             layers.extend([
                 nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
                 nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
+                nn.ReLU(inplace=True),
             ])
             in_channels = out_channels
         return nn.Sequential(*layers)
 
-    def _build_decoder(self) -> nn.Sequential:
-        """
-        Construct the decoder CNN layers.
+    def _calculate_conv_output_size(self):
+        dummy_input = torch.zeros(1, self.config.input_channels, self.config.image_hw, self.config.image_hw)
+        with torch.no_grad():
+            output = self.encoder(dummy_input)
+            self.conv_output_shape = output.shape[1:]
+            self.conv_output_size = output.view(1, -1).size(1)
 
-        Returns:
-            nn.Sequential: Decoder network.
-        """
+    def _build_decoder(self) -> nn.Sequential:
         layers = []
         hidden_channels = list(reversed(self.config.hidden_channels))
         for i, in_channels in enumerate(hidden_channels):
@@ -122,137 +173,60 @@ class VariationalAutoencoder(nn.Module):
             )
             is_last = i == len(hidden_channels) - 1
             layers.extend([
-                nn.ConvTranspose2d(
-                    in_channels, out_channels, kernel_size=4, stride=2, padding=1
-                ),
-                nn.InstanceNorm2d(out_channels) if not is_last else nn.Identity(),
+                nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(out_channels) if not is_last else nn.Identity(),
                 nn.ReLU(inplace=True) if not is_last else nn.Sigmoid(),
             ])
         return nn.Sequential(*layers)
 
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode input images into latent space parameters.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Mean and log variance.
-        """
-        x = x.to(self.device)
         h = self.encoder(x)
         h = h.view(h.size(0), -1)
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
-
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the reparameterization trick.
-
-        Args:
-            mu (torch.Tensor): Mean.
-            logvar (torch.Tensor): Log variance.
-
-        Returns:
-            torch.Tensor: Sampled latent vector.
-        """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        return self.fc_mu(h), self.fc_logvar(h)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Decode latent vector to reconstructed image.
-
-        Args:
-            z (torch.Tensor): Latent vector.
-
-        Returns:
-            torch.Tensor: Reconstructed image.
-        """
-        z = z.to(self.device)
         h = self.fc_decode(z)
         h = h.view(h.size(0), *self.conv_output_shape)
         return self.decoder(h)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Full VAE forward pass: encode, reparameterize, decode.
+# --- Demonstration ---
 
-        Args:
-            x (torch.Tensor): Input image.
+def run_conv_vae_demo():
+    """Demonstrates the Convolutional VAE with image data."""
+    print("--- Testing Convolutional VAE ---")
+    config = ConvVAEConfig(
+        input_channels=3,
+        image_hw=64,
+        latent_dim=64,
+        beta=0.5
+    )
+    print("Config:", config.to_dict())
+    conv_vae = ConvVAE(config).to("cuda" if torch.cuda.is_available() else "cpu")
 
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                Reconstruction, mean, and log variance.
-        """
-        x = x.to(self.device)
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        reconstruction = self.decode(z)
-        return reconstruction, mu, logvar
+    # Test preprocessing
+    mock_image_np = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+    preprocessed = ConvVAE.preprocess_observation(mock_image_np)
+    print(f"\nPreprocessing successful. Input shape: {mock_image_np.shape}, Output shape: {preprocessed.shape}")
+    assert preprocessed.shape == (1, 3, 64, 64)
 
-    def loss(self, x: torch.Tensor, reconstruction: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        """
-        Compute VAE loss combining reconstruction and KL divergence.
+    # Test forward and backward pass
+    mock_batch = torch.rand(16, 3, 64, 64)
+    recon_images, mu, logvar, z = conv_vae(mock_batch)
+    print(f"Forward pass successful. Reconstruction shape: {recon_images.shape}")
+    assert recon_images.shape == mock_batch.shape
 
-        Args:
-            x (torch.Tensor): Original input.
-            reconstruction (torch.Tensor): Reconstructed image.
-            mu (torch.Tensor): Mean from encoder.
-            logvar (torch.Tensor): Log variance from encoder.
+    loss, loss_dict = conv_vae.loss(mock_batch, recon_images, mu, logvar)
+    loss.backward()
+    print("Loss calculation and backward pass successful.")
+    for key, value in loss_dict.items():
+        print(f"  {key}: {value:.4f}")
 
-        Returns:
-            Tuple[torch.Tensor, dict]: Total loss and component breakdown.
-        """
-        recon_loss = F.mse_loss(reconstruction, x, reduction="sum") / x.size(0)
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
-        total_loss = recon_loss + self.config.beta * kl_loss
-        return total_loss, {
-            "total_loss": total_loss.item(),
-            "recon_loss": recon_loss.item(),
-            "kl_loss": kl_loss.item()
-        }
-
-    def get_latent(self, x: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        """
-        Get latent vector from input.
-
-        Args:
-            x (torch.Tensor): Input image.
-            deterministic (bool): Use mean if True, else sample.
-
-        Returns:
-            torch.Tensor: Latent representation.
-        """
-        with torch.no_grad():
-            mu, logvar = self.encode(x)
-            return mu if deterministic else self.reparameterize(mu, logvar)
+    # Test latent vector retrieval
+    latent_z = conv_vae.get_latent(preprocessed)
+    print(f"Latent vector retrieval successful. Shape: {latent_z.shape}\n")
+    assert latent_z.shape == (1, config.latent_dim)
 
 
-def preprocess_observation(obs: np.ndarray, target_size: Tuple[int, int] = (64, 64)) -> torch.Tensor:
-    """
-    Preprocess an observation for model input.
-
-    Args:
-        obs (np.ndarray): Image array.
-        target_size (Tuple[int, int]): Resize target.
-
-    Returns:
-        torch.Tensor: Preprocessed tensor.
-    """
-    if isinstance(obs, np.ndarray):
-        obs = torch.from_numpy(obs).float()
-    if obs.dim() == 2:
-        obs = obs.unsqueeze(0).unsqueeze(0)
-    elif obs.dim() == 3:
-        if obs.shape[-1] in [1, 3]:
-            obs = obs.permute(2, 0, 1)
-        obs = obs.unsqueeze(0)
-    if obs.shape[-2:] != target_size:
-        obs = F.interpolate(obs, size=target_size, mode="bilinear", align_corners=False)
-    if obs.max() > 1.0:
-        obs = obs / 255.0
-    return obs
+if __name__ == '__main__':
+    run_conv_vae_demo()
+    print("All VAE tests passed! ✓")
