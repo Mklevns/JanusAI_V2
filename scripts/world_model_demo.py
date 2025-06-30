@@ -16,7 +16,10 @@ from pathlib import Path
 
 from janus.agents.components.vae import VariationalAutoencoder
 from janus.agents.components.mdn_rnn import MDNRNN
-from janus.training.ppo.world_model_trainer import WorldModelPPOTrainer, WorldModelConfig
+from janus.training.ppo.world_model_trainer import (
+    WorldModelPPOTrainer,
+    WorldModelConfig,
+)
 from janus.training.ppo.config import PPOConfig
 from janus.agents.ppo_agent import PPOAgent, NetworkConfig
 
