@@ -1,187 +1,137 @@
-name: Multi-LLM Code Quality Pipeline
+# Name of the GitHub Actions workflow.
+name: JanusAI_V2 Code Companion Pipeline
 
+# Controls when the workflow will run.
 on:
+  # Triggers the workflow on pull request events but only for the main, master, and develop branches.
   pull_request:
     types: [opened, synchronize, reopened]
+    branches: [main, master, develop]
+    # Only run the workflow if specific file types relevant to the JanusAI_V2 project are changed.
     paths:
-      - '**.py'          # Python files
-      - '**.ipynb'       # Jupyter notebooks
-      - '**.yaml'        # Config files
-      - '**.yml'         # Config files
-      - '**.json'        # JSON configs
-      - '**.toml'        # TOML configs
-      - '**.md'          # Documentation
+      - '**.py'
+      - '**.ipynb'
+      - '**.md'
+      - '**.json'
+      - '**.yaml'
+      - '**.yml'
       - 'requirements.txt'
       - 'pyproject.toml'
-      - 'setup.py'
 
-  # Allow manual triggering
+  # Allows you to run this workflow manually from the Actions tab.
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to analyze'
+        description: 'PR number to analyze (for manual runs)'
         required: false
         type: string
 
+# Defines the permissions granted to the GITHUB_TOKEN for this workflow.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel.
 jobs:
+  # The main job that runs the multi-LLM analysis.
   multi-llm-analysis:
+    # The type of runner that the job will run on.
     runs-on: ubuntu-latest
-    
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      
+    name: JanusAI_V2 Analysis Gauntlet
+
+    # A sequence of tasks called "steps" that will be executed as part of the job.
     steps:
-    - name: Checkout code
+    # Step 1: Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it.
+    - name: Checkout JanusAI_V2 Code
       uses: actions/checkout@v4
       with:
+        # Fetch all history for all branches and tags.
         fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Setup Python
+
+    # Step 2: Sets up a Python environment for use in actions.
+    - name: Setup Python 3.11
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+        # Cache pip dependencies for faster subsequent runs.
         cache: 'pip'
-    
-    - name: Install Multi-LLM Pipeline
+
+    # Step 3: Installs the Python dependencies required by the pipeline.
+    # These are taken from your pyproject.toml file.
+    - name: Install Pipeline Dependencies
       run: |
-        pip install --upgrade pip
+        python -m pip install --upgrade pip
         pip install openai anthropic google-genai requests gitpython
-        
-        # Download pipeline files
-        curl -sL https://github.com/multi-llm-pipeline/releases/latest/download/pipeline.tar.gz | tar xz
-        
-        # Alternative: Install from source (if available)
-        # git clone https://github.com/your-pipeline-repo/multi-llm-pipeline.git pipeline
-        # cd pipeline && pip install -e .
-    
-    - name: Configure for AI/ML Project
+
+    # Step 4: Configures the pipeline specifically for the JanusAI_V2 project.
+    # It creates a configuration file that sets the project type to 'ai_ml' and specifies
+    # the exact focus areas for analysis as detailed in your setup documents.
+    - name: Configure for JanusAI_V2 Multimodal AI Project
       run: |
-        # Set AI/ML specific prompts for JanusAI_V2
+        echo "Creating pipeline configuration for JanusAI_V2 (AI/ML Project)"
         python -c "
         import json
         config = {
-          'project_type': 'ai_ml',
-          'focus_areas': [
-            'model_architecture',
-            'training_stability', 
-            'data_processing',
-            'numerical_stability',
-            'memory_optimization',
-            'gpu_utilization',
-            'multimodal_integration'
-          ],
-          'custom_prompts': {
-            'janus_specific': 'Focus on multimodal AI architecture, vision-language model integration, and training pipeline optimization'
+          'active_project_type': 'ai_ml',
+          'project_types': {
+            'ai_ml': {
+              'name': 'JanusAI_V2 Multimodal AI',
+              'description': 'Specialized analysis for the JanusAI_V2 vision-language model.',
+              'stage_1_gemini': {
+                'focus_areas': [
+                  'model_architecture',
+                  'training_stability',
+                  'data_processing',
+                  'numerical_stability',
+                  'memory_optimization',
+                  'gpu_utilization',
+                  'multimodal_integration'
+                ],
+                'system_instruction': 'You are an expert multimodal AI analyst specializing in vision-language models. Focus on JanusAI_V2 specific issues: 1. **Multimodal Architecture**: Cross-modal attention mechanisms, vision-language alignment. 2. **Training Stability**: Gradient flow between modalities, convergence issues. 3. **Data Processing**: Image-text pair handling, batch processing efficiency. 4. **Memory Management**: VRAM usage, tensor caching, gradient accumulation. 5. **Performance**: Inference speed, model size optimization, quantization issues. Analyze code for multimodal AI patterns and provide actionable recommendations.'
+              },
+              'stage_2_chatgpt': {
+                  'system_prompt': 'You are an expert multimodal AI engineer for vision-language models. Generate improved code for JanusAI_V2 that: 1. Optimizes cross-modal attention and fusion mechanisms. 2. Implements stable training procedures for multimodal models. 3. Improves vision-language data preprocessing pipelines. 4. Enhances memory efficiency for large multimodal models. 5. Adds proper multimodal evaluation and validation logic. Focus on creating robust, efficient multimodal AI systems.'
+              },
+              'stage_3_claude': {
+                  'system_prompt': 'You are an expert multimodal system integrator for JanusAI_V2. Ensure multimodal improvements maintain: 1. Consistent vision-language data flow and tensor operations. 2. Compatible multimodal model configurations. 3. Unified training and evaluation pipelines. 4. Proper experiment tracking for multimodal metrics. 5. Consistent API interfaces across vision and language components. Integrate code while preserving multimodal architecture consistency.'
+              },
+              'stage_4_deepseek': {
+                  'system_prompt': 'You are a senior multimodal AI quality engineer for JanusAI_V2. Verify multimodal code for: 1. Cross-modal alignment correctness and mathematical validity. 2. Training stability across vision and language modalities. 3. Multimodal data pipeline integrity and preprocessing quality. 4. Inference efficiency and real-time performance. 5. Vision-language evaluation methodology and metrics. 6. Scalability for large multimodal datasets. Provide multimodal-specific quality assessment and recommendations.'
+              }
+            }
           }
         }
-        with open('pipeline_config.json', 'w') as f:
+        with open('prompt_config.json', 'w') as f:
           json.dump(config, f, indent=2)
         "
+        
+    # Step 5: Executes the main pipeline script.
+    # It uses the secrets you've set up in your repository to authenticate with the LLM APIs.
+    - name: Run Multi-LLM Code Companion Pipeline
+      run: python main.py
       env:
-        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-    
-    - name: Run Multi-LLM Pipeline Analysis
-      run: |
-        python main.py
-      env:
+        # Secrets are passed as environment variables to the script.
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         REPOSITORY: ${{ github.repository }}
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        # Determines the PR number from the event payload.
         PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        # Explicitly sets the project type for the run.
         PROJECT_TYPE: "ai_ml"
-    
-    - name: Run Advanced Workflow Analysis
-      if: always()
-      run: |
-        python advanced_pipeline_workflow.py
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        REPOSITORY: ${{ github.repository }}
-        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
-        PROJECT_TYPE: "ai_ml"
-    
-    - name: Upload Analysis Results
-      if: always()
-      uses: actions/upload-artifact@v3
+
+    # Step 6: Uploads the analysis results as an artifact.
+    # This allows you to download and inspect the detailed report, logs, and results after the run.
+    - name: Upload Analysis Artifacts
+      if: always() # This step runs even if previous steps fail.
+      uses: actions/upload-artifact@v4
       with:
         name: multi-llm-analysis-results
         path: |
           pipeline_results.json
-          workflow_execution.log
           analysis_report.md
-        retention-days: 30
-    
-    - name: Comment Analysis Summary
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const fs = require('fs');
-          
-          try {
-            // Read analysis results if available
-            let analysisComment = '## 🤖 Multi-LLM Code Analysis Complete\n\n';
-            
-            if (fs.existsSync('analysis_report.md')) {
-              const report = fs.readFileSync('analysis_report.md', 'utf8');
-              analysisComment += report;
-            } else {
-              analysisComment += '✅ Analysis completed successfully. Check the detailed report in the pipeline logs.\n\n';
-              analysisComment += '**Analysis Focus Areas for JanusAI_V2:**\n';
-              analysisComment += '- 🧠 Model architecture optimization\n';
-              analysisComment += '- 🔄 Training pipeline stability\n';
-              analysisComment += '- 👁️ Vision-language integration\n';
-              analysisComment += '- ⚡ Performance and memory optimization\n';
-              analysisComment += '- 🔧 Multimodal processing efficiency\n\n';
-              analysisComment += '_Analysis powered by Gemini, ChatGPT, Claude, and DeepSeek_';
-            }
-            
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: analysisComment
-            });
-          } catch (error) {
-            console.log('Error posting comment:', error);
-          }
-
-  # Separate job for security analysis (optional)
-  security-scan:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Run Security Analysis
-      run: |
-        # Additional security checks for AI/ML code
-        pip install bandit safety
-        
-        # Check for security issues
-        bandit -r . -f json -o security_report.json || true
-        
-        # Check dependencies for vulnerabilities
-        safety check --json --output safety_report.json || true
-    
-    - name: Upload Security Results
-      uses: actions/upload-artifact@v3
-      with:
-        name: security-analysis
-        path: |
-          security_report.json
-          safety_report.json
+          *.log
+        retention-days: 7
